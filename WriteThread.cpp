@@ -1835,7 +1835,7 @@ int CWriteThread::DetectCommand(void)
         m_LogWnd->AddMessage(LOG_NORMAL, MSG(59));
         Dlg->m_RawFlag = MSG(56);
         PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
-        return WRITEMODE_RAW_16;
+        return WRITEMODE_2048;
     }
 
     return -1;

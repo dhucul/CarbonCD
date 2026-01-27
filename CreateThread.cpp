@@ -130,7 +130,7 @@ bool CCreateThread::CreateIso(void)
             return false;
         }
         fprintf(fp, "FILE \"%s\" BINARY\n", m_ImgFileName);
-        fprintf(fp, "%s", CueSheet);
+        fprintf(fp, "%s", (LPCTSTR)CueSheet);
         fclose(fp);
     }
 

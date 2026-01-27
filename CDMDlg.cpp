@@ -58,7 +58,7 @@ BOOL CAboutDlg::OnInitDialog()
     m_VerString.Format("Version %s", APP_VERSION);
     SetWindowText(theSetting.m_Lang.m_Str[LP_ABOUT + 0]);
     this->SetDlgItemText(IDC_SUBTITLE, theSetting.m_Lang.m_Str[LP_ABOUT + 1]);
-    this->SetDlgItemText(IDC_AUTHOR, "Copyright © 2015 Rizonesoft");
+    this->SetDlgItemText(IDC_AUTHOR, "Copyright (C) 2015 Rizonesoft");
     SetDlgItemText(IDOK, theSetting.m_Lang.m_Str[1]);
     UpdateData(FALSE);
     return TRUE; // return TRUE unless you set the focus to a control
