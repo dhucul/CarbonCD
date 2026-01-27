@@ -2,93 +2,116 @@
 
 #include "Aspi.h"
 #include "PBBuffer.h"
+
+#include <windows.h>
+#include <winioctl.h>
+#include <ntddscsi.h>
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+
+// Keep SS_ERR available
 #ifndef SS_ERR
 #define SS_ERR 0x04
 #endif
-//   SPTI structures
-#define CTL_CODE( DeviceType, Function, Method, Access ) (                 \
-        ((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method) \
-                                                         )
-#define FILE_DEVICE_CONTROLLER          0x00000004
-#define METHOD_BUFFERED                 0
-#define FILE_READ_ACCESS          ( 0x0001 )    // file & pipe
-#define FILE_WRITE_ACCESS         ( 0x0002 )    // file & pipe
-#define IOCTL_SCSI_BASE                 FILE_DEVICE_CONTROLLER
-#define IOCTL_SCSI_PASS_THROUGH_DIRECT  CTL_CODE(IOCTL_SCSI_BASE, 0x0405, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
-#define IOCTL_SCSI_GET_INQUIRY_DATA     CTL_CODE(IOCTL_SCSI_BASE, 0x0403, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-#define SCSI_IOCTL_DATA_OUT          0
-#define SCSI_IOCTL_DATA_IN           1
-#define SCSI_IOCTL_DATA_UNSPECIFIED  2
-
-typedef struct _SCSI_PASS_THROUGH_DIRECT
-{
-    USHORT Length;
-    UCHAR ScsiStatus;
-    UCHAR PathId;
-    UCHAR TargetId;
-    UCHAR Lun;
-    UCHAR CdbLength;
-    UCHAR SenseInfoLength;
-    UCHAR DataIn;
-    ULONG DataTransferLength;
-    ULONG TimeOutValue;
-    PVOID DataBuffer;
-    ULONG SenseInfoOffset;
-    UCHAR Cdb[16];
-} SCSI_PASS_THROUGH_DIRECT, *PSCSI_PASS_THROUGH_DIRECT;
-
-typedef struct _SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER
+// Wrapper that includes a sense buffer.
+// (Windows provides SCSI_PASS_THROUGH_DIRECT, but not this exact convenience wrapper.)
+#pragma pack(push, 1)
+struct SPTD_WITH_SENSE
 {
     SCSI_PASS_THROUGH_DIRECT sptd;
-    ULONG Filler; // realign buffer to double word boundary
-    UCHAR ucSenseBuf[32];
-} SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER, *PSCSI_PASS_THROUGH_DIRECT_WITH_BUFFER;
-
-typedef struct _SCSI_INQUIRY_DATA
-{
-    UCHAR PathId;
-    UCHAR TargetId;
-    UCHAR Lun;
-    BOOLEAN DeviceClaimed;
-    ULONG InquiryDataLength;
-    ULONG NextInquiryDataOffset;
-    UCHAR InquiryData[100];
-} SCSI_INQUIRY_DATA, *PSCSI_INQUIRY_DATA;
+    ULONG Filler;            // alignment
+    UCHAR Sense[32];
+};
+#pragma pack(pop)
 
 class CSptiDriver : public CAspi
 {
 public:
     CSptiDriver();
-    ~CSptiDriver() override;
+    virtual ~CSptiDriver();
 
-    void ExecuteCommand(SRB_ExecSCSICmd& cmd) override;
-    DWORD GetVersion(void) override;
-    BOOL IsActive(void) override;
-    void Initialize(void) override;
-    void InitialAsync(void) override;
-    void FinalizeAsync(void) override;
-    bool ExecuteCommandAsync(SRB_ExecSCSICmd& cmd) override;
-    int GetDeviceCount(void) override;
-    void GetDeviceString(CString& Vendor, CString& Product, CString& Revision, CString& BusAddress) override;
-    void SetDevice(int DeviceNo) override;
-    int GetCurrentDevice(void) override;
+    CSptiDriver(const CSptiDriver&) = delete;
+    CSptiDriver& operator=(const CSptiDriver&) = delete;
 
-protected:
-    char m_Address[27];
-    int m_DeviceCount;
-    int m_CurrentDevice;
-    CPBBuffer m_Buffer;
-    HANDLE m_hThread;
-    DWORD m_ThreadID;
+    // CAspi overrides (same signatures)
+    virtual void  ExecuteCommand(SRB_ExecSCSICmd& cmd);
+    virtual DWORD GetVersion();
+    virtual BOOL  IsActive();
+
+    virtual void  Initialize();
+    virtual void  InitialAsync();
+    virtual void  FinalizeAsync();
+    virtual bool  ExecuteCommandAsync(SRB_ExecSCSICmd& cmd);
+
+    virtual int   GetDeviceCount();
+    virtual void  GetDeviceString(CString& Vendor, CString& Product, CString& Revision, CString& BusAddress);
+    virtual void  SetDevice(int DeviceNo);
+    virtual int   GetCurrentDevice();
 
 public:
-    HANDLE m_hDevice;
-    SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER m_SptiCmd;
-    BOOL m_Status;
-    bool m_ExitFlag;
-    HANDLE m_hWaitEvent;
-    HANDLE m_hCommandEvent;
+    int debug = 0; // preserved
 
-    int debug;
+private:
+    class UniqueHandle
+    {
+    public:
+        UniqueHandle() : h_(NULL) {}
+        explicit UniqueHandle(HANDLE h) : h_(h) {}
+        ~UniqueHandle() { reset(); }
+
+        UniqueHandle(const UniqueHandle&) = delete;
+        UniqueHandle& operator=(const UniqueHandle&) = delete;
+
+        UniqueHandle(UniqueHandle&& other) noexcept : h_(other.release()) {}
+        UniqueHandle& operator=(UniqueHandle&& other) noexcept
+        {
+            if (this != &other) reset(other.release());
+            return *this;
+        }
+
+        HANDLE get() const { return h_; }
+        operator bool() const { return h_ && h_ != INVALID_HANDLE_VALUE; }
+
+        HANDLE release()
+        {
+            HANDLE tmp = h_;
+            h_ = NULL;
+            return tmp;
+        }
+
+        void reset(HANDLE nh = NULL)
+        {
+            if (h_ && h_ != INVALID_HANDLE_VALUE)
+                ::CloseHandle(h_);
+            h_ = nh;
+        }
+
+    private:
+        HANDLE h_;
+    };
+
+private:
+    void open_device_by_letter(char driveLetter);
+    static DWORD WINAPI thread_proc(LPVOID self);
+
+private:
+    std::array<char, 26> m_DeviceLetters{};
+    int m_DeviceCount = 0;
+    int m_CurrentDevice = -1;
+
+    CPBBuffer m_Buffer; // preserved
+
+    UniqueHandle m_Device;
+    UniqueHandle m_WaitEvent;     // auto-reset
+    UniqueHandle m_CommandEvent;  // auto-reset
+    UniqueHandle m_Thread;
+
+    DWORD m_ThreadID = 0;
+    std::atomic_bool m_ExitFlag{ false };
+
+    SPTD_WITH_SENSE m_Spti{};
+    BOOL m_Status = FALSE;
 };

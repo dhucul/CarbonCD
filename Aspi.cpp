@@ -1,73 +1,35 @@
-// CAspi.cpp - single file, C++03/MSVC friendly
-
 #include "StdAfx.h"
 #include "Aspi.h"
-#include "Setting.h"
 #include "PBBuffer.h"
 
-#include <cstring> // memset, memcpy
+#include <cstring>
 
-// Local helper to avoid std::min / min macro issues
 static DWORD MinDWORD(DWORD a, DWORD b) { return (a < b) ? a : b; }
 
-CAspi::CAspi()
-{
-}
+CAspi::CAspi() {}
+CAspi::~CAspi() {}
 
-CAspi::~CAspi()
-{
-}
+void CAspi::Initialize() {}
+BOOL CAspi::IsActive() { return FALSE; }
+DWORD CAspi::GetVersion() { return 0; }
+void CAspi::ExecuteCommand(SRB_ExecSCSICmd& /*cmd*/) {}
 
-void CAspi::Initialize()
-{
-    // TODO
-}
-
-BOOL CAspi::IsActive()
-{
-    // TODO
-    return FALSE;
-}
-
-DWORD CAspi::GetVersion()
-{
-    // TODO
-    return 0;
-}
-
-void CAspi::ExecuteCommand(SRB_ExecSCSICmd& /*cmd*/)
-{
-    // TODO: issue SRB to ASPI layer and fill cmd.SRB_Status, etc.
-}
-
-void CAspi::InitialAsync(void)
-{
-    // TODO
-}
-
-void CAspi::FinalizeAsync(void)
-{
-    // TODO
-}
-
-bool CAspi::ExecuteCommandAsync(SRB_ExecSCSICmd& /*cmd*/)
-{
-    // TODO
-    return false;
-}
+void CAspi::InitialAsync() {}
+void CAspi::FinalizeAsync() {}
+bool CAspi::ExecuteCommandAsync(SRB_ExecSCSICmd& /*cmd*/) { return false; }
 
 // Returns offset (ModeDataPoint) on success, 0 on failure.
-// Copies up to BufLen bytes into Buffer; zero-fills remainder on success/failure.
+// Copies up to BufLen bytes into Buffer; zero-fills remainder.
 DWORD CAspi::ModeSense(BYTE* Buffer, DWORD BufLen, BYTE PCFlag, BYTE PageCode)
 {
-    if (Buffer == 0 || BufLen == 0)
+    if (!Buffer || BufLen == 0)
         return 0;
 
     const DWORD kLocalCap = 256;
 
-    CPBBuffer PBuffer;
-    BYTE* LocalBuffer = PBuffer.CreateBuffer(kLocalCap);
-    if (LocalBuffer == 0)
+    CPBBuffer temp;
+    BYTE* local = temp.CreateBuffer(kLocalCap);
+    if (!local)
     {
         std::memset(Buffer, 0, BufLen);
         return 0;
@@ -75,11 +37,11 @@ DWORD CAspi::ModeSense(BYTE* Buffer, DWORD BufLen, BYTE PCFlag, BYTE PageCode)
 
     SRB_ExecSCSICmd cmd;
     std::memset(&cmd, 0, sizeof(cmd));
-    std::memset(LocalBuffer, 0, kLocalCap);
+    std::memset(local, 0, kLocalCap);
 
     cmd.SRB_Flags = SRB_DIR_IN;
     cmd.SRB_BufLen = kLocalCap;
-    cmd.SRB_BufPointer = LocalBuffer;
+    cmd.SRB_BufPointer = local;
     cmd.SRB_CDBLen = 0x0A;
 
     // MODE SENSE(10)
@@ -96,9 +58,7 @@ DWORD CAspi::ModeSense(BYTE* Buffer, DWORD BufLen, BYTE PCFlag, BYTE PageCode)
         return 0;
     }
 
-    // Need at least Mode Parameter Header(10) = 8 bytes
-    // Your original code: DataLen = ((buf[0]<<8)|buf[1]) + 2
-    DWORD dataLen = (((DWORD)LocalBuffer[0] << 8) | (DWORD)LocalBuffer[1]) + 2;
+    DWORD dataLen = (((DWORD)local[0] << 8) | (DWORD)local[1]) + 2;
     if (dataLen > kLocalCap) dataLen = kLocalCap;
 
     if (dataLen < 8)
@@ -107,7 +67,7 @@ DWORD CAspi::ModeSense(BYTE* Buffer, DWORD BufLen, BYTE PCFlag, BYTE PageCode)
         return 0;
     }
 
-    DWORD blockDescLen = ((DWORD)LocalBuffer[6] << 8) | (DWORD)LocalBuffer[7];
+    DWORD blockDescLen = ((DWORD)local[6] << 8) | (DWORD)local[7];
     DWORD modeDataPoint = blockDescLen + 8;
 
     if (modeDataPoint >= dataLen)
@@ -116,9 +76,8 @@ DWORD CAspi::ModeSense(BYTE* Buffer, DWORD BufLen, BYTE PCFlag, BYTE PageCode)
         return 0;
     }
 
-    // Copy safely into caller buffer
-    DWORD toCopy = MinDWORD(dataLen, BufLen);
-    std::memcpy(Buffer, LocalBuffer, toCopy);
+    const DWORD toCopy = MinDWORD(dataLen, BufLen);
+    std::memcpy(Buffer, local, toCopy);
     if (toCopy < BufLen)
         std::memset(Buffer + toCopy, 0, BufLen - toCopy);
 
@@ -127,24 +86,21 @@ DWORD CAspi::ModeSense(BYTE* Buffer, DWORD BufLen, BYTE PCFlag, BYTE PageCode)
 
 bool CAspi::ModeSelect(BYTE* Buffer, DWORD BufLen)
 {
-    if (Buffer == 0 || BufLen == 0)
+    if (!Buffer || BufLen == 0)
         return false;
 
-    CPBBuffer PBuffer;
-    BYTE* out = PBuffer.CreateBuffer(BufLen);
-    if (out == 0)
+    CPBBuffer temp;
+    BYTE* out = temp.CreateBuffer(BufLen);
+    if (!out)
         return false;
 
-    // Copy caller's buffer into our outgoing buffer
     std::memcpy(out, Buffer, BufLen);
 
-    // If you need these header bytes cleared, do it on outgoing data (NOT the caller's Buffer)
+    // If the header bytes must be cleared, do it on outgoing data (not caller's buffer)
     if (BufLen > 5)
     {
-        out[0] = 0;
-        out[1] = 0;
-        out[4] = 0;
-        out[5] = 0;
+        out[0] = 0; out[1] = 0;
+        out[4] = 0; out[5] = 0;
     }
 
     SRB_ExecSCSICmd cmd;
@@ -162,28 +118,10 @@ bool CAspi::ModeSelect(BYTE* Buffer, DWORD BufLen)
     cmd.CDBByte[8] = (BYTE)(BufLen & 0xFF);
 
     ExecuteCommand(cmd);
-
     return (cmd.SRB_Status == SS_COMP);
 }
 
-int CAspi::GetDeviceCount(void)
-{
-    // TODO
-    return 0;
-}
-
-void CAspi::SetDevice(int /*DeviceNo*/)
-{
-    // TODO
-}
-
-void CAspi::GetDeviceString(CString& /*Vendor*/, CString& /*Product*/, CString& /*Revision*/, CString& /*BusAddress*/)
-{
-    // TODO
-}
-
-int CAspi::GetCurrentDevice(void)
-{
-    // TODO
-    return 0;
-}
+int CAspi::GetDeviceCount() { return 0; }
+void CAspi::SetDevice(int /*DeviceNo*/) {}
+void CAspi::GetDeviceString(CString& /*Vendor*/, CString& /*Product*/, CString& /*Revision*/, CString& /*BusAddress*/) {}
+int CAspi::GetCurrentDevice() { return 0; }

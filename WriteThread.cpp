@@ -1,4 +1,4 @@
-// writethread.cpp  (updated – UI-thread safe + safety/robustness fixes)
+// writethread.cpp  (updated  UI-thread safe + safety/robustness fixes)
 //
 // What changed (UI safety):
 // - Worker thread NEVER touches any dialog controls or dialog CString members.
@@ -20,6 +20,7 @@
 #include "CheckSector.h"
 
 #include <windows.h>
+#include <process.h>
 #include <cstring>
 
 // ---- small helpers ----------------------------------------------------------
@@ -163,19 +164,17 @@ static int UiAskYesNo(CWriteThread* t, const CString& text, const CString& capti
 
 // ---- thread proc ------------------------------------------------------------
 
-// Thread function for CWriteThread
-static DWORD WINAPI WriteThread(LPVOID Thread)
+// Thread function for CWriteThread (use _beginthreadex for CRT safety)
+static unsigned __stdcall WriteThreadProc(void* p)
 {
-    DWORD ret = static_cast<CWriteThread*>(Thread)->ThreadFunction();
-    ExitThread(ret);
-    return ret;
+    return static_cast<unsigned>(static_cast<CWriteThread*>(p)->ThreadFunction());
 }
 
 CWriteThread::CWriteThread(void)
     : m_CueFileName(_T(""))
 {
-    m_StopFlag = false;
-    m_hThread = INVALID_HANDLE_VALUE;
+    m_StopFlag.store(false, std::memory_order_relaxed);
+    m_hThread = nullptr;
     m_List = nullptr;
     m_Dir = nullptr;
 }
@@ -188,41 +187,35 @@ CWriteThread::~CWriteThread(void)
 void CWriteThread::StartThread(void)
 {
     StopThread();
-    m_StopFlag = false;
+    m_StopFlag.store(false, std::memory_order_release);
 
-    m_hThread = CreateThread(nullptr, 0, WriteThread, this, 0, &m_ThreadID);
+    uintptr_t th = _beginthreadex(nullptr, 0, &WriteThreadProc, this, 0, nullptr);
+    m_hThread = th ? reinterpret_cast<HANDLE>(th) : nullptr;
 
-    // CreateThread returns NULL on failure.
-    if (m_hThread == nullptr)
-    {
-        m_hThread = INVALID_HANDLE_VALUE;
+    if (!m_hThread)
         return;
-    }
 
     SetThreadPriority(m_hThread, THREAD_PRIORITY_HIGHEST);
 }
 
+
 void CWriteThread::StopThread(void)
 {
-    if (m_hThread == INVALID_HANDLE_VALUE || m_hThread == nullptr)
-    {
-        m_hThread = INVALID_HANDLE_VALUE;
+    if (!m_hThread)
         return;
-    }
 
     // Cooperative cancellation only.
-    m_StopFlag = true;
-    MemoryBarrier(); // best-effort visibility if m_StopFlag is plain bool
+    m_StopFlag.store(true, std::memory_order_release);
 
     DWORD exitCode = 0;
     if (GetExitCodeThread(m_hThread, &exitCode) && exitCode == STILL_ACTIVE)
-    {
         WaitForSingleObject(m_hThread, INFINITE);
-    }
 
     CloseHandle(m_hThread);
-    m_hThread = INVALID_HANDLE_VALUE;
+    m_hThread = nullptr;
 }
+
+
 
 DWORD CWriteThread::ThreadFunction(void)
 {
@@ -253,7 +246,7 @@ DWORD CWriteThread::ThreadFunction(void)
 
     m_Success = false;
 
-    if (!m_StopFlag)
+    if (!m_StopFlag.load(std::memory_order_acquire))
     {
         UiProgress(this, 100);
 
@@ -378,7 +371,7 @@ DWORD CWriteThread::WriteImage(void)
         UiLog(this, LOG_INFO, cs);
     }
 
-    if (m_StopFlag)
+    if (m_StopFlag.load(std::memory_order_acquire))
         return 0;
 
     // check drive
@@ -402,7 +395,7 @@ DWORD CWriteThread::WriteImage(void)
             return 0;
         }
 
-        if (m_StopFlag)
+        if (m_StopFlag.load(std::memory_order_acquire))
             return 0;
     }
 
@@ -468,7 +461,7 @@ DWORD CWriteThread::WriteImage(void)
         return 0;
     }
 
-    if (m_StopFlag)
+    if (m_StopFlag.load(std::memory_order_acquire))
     {
         m_CD->AbortWriting();
         return 0;
@@ -477,7 +470,7 @@ DWORD CWriteThread::WriteImage(void)
     // writing
     RetVal = m_ModeMS ? WriteImageSubMS() : WriteImageSubSS();
 
-    if (!RetVal && !m_StopFlag)
+    if (!RetVal && !m_StopFlag.load(std::memory_order_acquire))
     {
         BYTE sk, asc, ascq;
         m_CD->GetWriteErrorParams(sk, asc, ascq);
@@ -486,7 +479,7 @@ DWORD CWriteThread::WriteImage(void)
     }
 
     // flush/abort
-    if (!m_StopFlag && RetVal)
+    if (!m_StopFlag.load(std::memory_order_acquire) && RetVal)
     {
         UiMessage(this, MSG(37));
         m_CD->FinishWriting();
@@ -605,7 +598,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
 
         for (lba = m_SubMS.m_LeadInLBA[session]; lba != m_SubMS.m_PregapLBA[session]; lba++)
         {
-            if (ret == 0 || m_StopFlag)
+            if (ret == 0 || m_StopFlag.load(std::memory_order_acquire))
                 break;
 
             Sub96 = m_SubMS.GenerateLeadIn();
@@ -647,7 +640,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
 
         for (; lba != m_SubMS.m_MainDataLBA[session]; lba++)
         {
-            if (ret == 0 || m_StopFlag)
+            if (ret == 0 || m_StopFlag.load(std::memory_order_acquire))
                 break;
 
             Sub96 = m_SubMS.GeneratePreGap();
@@ -699,7 +692,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
         }
 
         // main data
-        if (ret && !m_StopFlag)
+        if (ret && !m_StopFlag.load(std::memory_order_acquire))
         {
             cs.Format(MSG(141), session + 1);
             UiLog(this, LOG_INFO, cs);
@@ -720,7 +713,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
                 size--;
             }
 
-            if (ret == 0 || m_StopFlag)
+            if (ret == 0 || m_StopFlag.load(std::memory_order_acquire))
                 break;
 
             if (!ReadExact(hSub, SubBuffer, 96) || !ReadExact(hImg, Buffer, 2352))
@@ -772,7 +765,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
         }
 
         // lead-out
-        if (ret && !m_StopFlag)
+        if (ret && !m_StopFlag.load(std::memory_order_acquire))
         {
             cs.Format(MSG(142), session + 1);
             UiLog(this, LOG_INFO, cs);
@@ -790,7 +783,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
         {
             if (lba >= size)
                 break;
-            if (ret == 0 || m_StopFlag)
+            if (ret == 0 || m_StopFlag.load(std::memory_order_acquire))
                 break;
 
             Sub96 = m_SubMS.GenerateLeadOut();
@@ -827,7 +820,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
             }
         }
 
-        if (ret == 0 || m_StopFlag)
+        if (ret == 0 || m_StopFlag.load(std::memory_order_acquire))
             break;
     }
 
@@ -835,7 +828,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
     if (hImg != INVALID_HANDLE_VALUE) CloseHandle(hImg);
     if (hPre != INVALID_HANDLE_VALUE) CloseHandle(hPre);
 
-    if (m_StopFlag)
+    if (m_StopFlag.load(std::memory_order_acquire))
         return 0;
 
     return ret;
@@ -859,7 +852,7 @@ DWORD CWriteThread::WriteImageSubSS(void)
     // lead-in
     for (i = 0; i < m_CD->GetLeadInSize(); i++)
     {
-        if (m_StopFlag) return 0;
+        if (m_StopFlag.load(std::memory_order_acquire)) return 0;
 
         if (!m_CD->WriteRawLeadIn())
         {
@@ -880,7 +873,7 @@ DWORD CWriteThread::WriteImageSubSS(void)
     // pregap
     for (i = 0; i < 150; i++)
     {
-        if (m_StopFlag) return 0;
+        if (m_StopFlag.load(std::memory_order_acquire)) return 0;
 
         if (!m_CD->WriteRawGap())
         {
@@ -924,7 +917,7 @@ DWORD CWriteThread::WriteImageSubSS(void)
             return 0;
         }
 
-        if (m_StopFlag)
+        if (m_StopFlag.load(std::memory_order_acquire))
         {
             CloseHandle(hFile);
             return 0;
@@ -957,7 +950,7 @@ DWORD CWriteThread::WriteImageSubSS(void)
 
         for (i = 0; i < 90 * 75; i++)
         {
-            if (m_StopFlag) return 0;
+            if (m_StopFlag.load(std::memory_order_acquire)) return 0;
 
             if (!m_CD->WriteRawGap())
             {
@@ -1025,7 +1018,7 @@ DWORD CWriteThread::Mastering(void)
         return 0;
     }
 
-    if (m_StopFlag)
+    if (m_StopFlag.load(std::memory_order_acquire))
         return 0;
 
     // check drive
@@ -1048,7 +1041,7 @@ DWORD CWriteThread::Mastering(void)
             return 0;
         }
 
-        if (m_StopFlag)
+        if (m_StopFlag.load(std::memory_order_acquire))
             return 0;
     }
 
@@ -1100,12 +1093,12 @@ DWORD CWriteThread::Mastering(void)
         return 0;
     }
 
-    if (m_StopFlag)
+    if (m_StopFlag.load(std::memory_order_acquire))
         return 0;
 
     RetVal = MasteringSub();
 
-    if (!m_StopFlag && RetVal)
+    if (!m_StopFlag.load(std::memory_order_acquire) && RetVal)
     {
         UiMessage(this, MSG(37));
         m_CD->FinishWriting();
@@ -1121,7 +1114,7 @@ DWORD CWriteThread::Mastering(void)
         m_CD->LoadTray(false);
     }
 
-    if (!RetVal && !m_StopFlag)
+    if (!RetVal && !m_StopFlag.load(std::memory_order_acquire))
     {
         BYTE sk, asc, ascq;
         m_CD->GetWriteErrorParams(sk, asc, ascq);
@@ -1161,7 +1154,7 @@ DWORD CWriteThread::MasteringSub(void)
 
     for (i = 0; i < m_CD->GetLeadInSize(); i++)
     {
-        if (m_StopFlag) return 0;
+        if (m_StopFlag.load(std::memory_order_acquire)) return 0;
 
         if (!m_CD->WriteRawLeadIn())
         {
@@ -1181,7 +1174,7 @@ DWORD CWriteThread::MasteringSub(void)
 
     for (i = 0; i < 150; i++)
     {
-        if (m_StopFlag) return 0;
+        if (m_StopFlag.load(std::memory_order_acquire)) return 0;
 
         if (!m_CD->WriteRawGap())
         {
@@ -1208,7 +1201,7 @@ DWORD CWriteThread::MasteringSub(void)
     {
         TrackType = m_List->GetItemData(i);
 
-        if (m_StopFlag) break;
+        if (m_StopFlag.load(std::memory_order_acquire)) break;
 
         if (TrackType == 0)
         {
@@ -1220,7 +1213,7 @@ DWORD CWriteThread::MasteringSub(void)
             {
                 while (iso.GetHeaderFrame(Buffer))
                 {
-                    if (m_StopFlag) break;
+                    if (m_StopFlag.load(std::memory_order_acquire)) break;
 
                     if (!m_CD->WriteRaw(Buffer))
                     {
@@ -1241,7 +1234,7 @@ DWORD CWriteThread::MasteringSub(void)
 #if COPY_PROTECTION
                 while (iso.GetProtectionArea(Buffer))
                 {
-                    if (m_StopFlag) break;
+                    if (m_StopFlag.load(std::memory_order_acquire)) break;
 
                     if (!m_CD->WriteRaw(Buffer))
                     {
@@ -1262,11 +1255,11 @@ DWORD CWriteThread::MasteringSub(void)
 
                 while (iso.OpenReadFile())
                 {
-                    if (m_StopFlag) break;
+                    if (m_StopFlag.load(std::memory_order_acquire)) break;
 
                     while (iso.GetFrame(Buffer))
                     {
-                        if (m_StopFlag) break;
+                        if (m_StopFlag.load(std::memory_order_acquire)) break;
 
                         if (!m_CD->WriteRaw(Buffer))
                         {
@@ -1300,7 +1293,7 @@ DWORD CWriteThread::MasteringSub(void)
 
                 while (true)
                 {
-                    if (m_StopFlag) break;
+                    if (m_StopFlag.load(std::memory_order_acquire)) break;
 
                     ReadFile(hFileRead, Buffer + 16, 2048, &read, nullptr);
                     if (read < 2048) break;
@@ -1341,7 +1334,7 @@ DWORD CWriteThread::MasteringSub(void)
 
                 while (true)
                 {
-                    if (m_StopFlag) break;
+                    if (m_StopFlag.load(std::memory_order_acquire)) break;
 
                     ReadFile(hFileRead, Buffer, 2352, &read, nullptr);
                     if (read < 2352) break;
@@ -1367,7 +1360,7 @@ DWORD CWriteThread::MasteringSub(void)
                 CloseHandle(hFileRead);
             }
 
-            if (m_StopFlag) break;
+            if (m_StopFlag.load(std::memory_order_acquire)) break;
             PrevTrackType = TrackType;
         }
         else
@@ -1409,7 +1402,7 @@ DWORD CWriteThread::MasteringSub(void)
             {
                 while (true)
                 {
-                    if (m_StopFlag) break;
+                    if (m_StopFlag.load(std::memory_order_acquire)) break;
 
                     ReadFile(hFileRead, Buffer, 2352, &read, nullptr);
 
@@ -1466,7 +1459,7 @@ DWORD CWriteThread::MasteringSub(void)
             PrevTrackType = TrackType;
         }
 
-        if (m_StopFlag) break;
+        if (m_StopFlag.load(std::memory_order_acquire)) break;
     }
 
     if (m_CD->GetWritingMode() != WRITEMODE_2048)
@@ -1476,7 +1469,7 @@ DWORD CWriteThread::MasteringSub(void)
 
         for (i = 0; i < 90 * 75; i++)
         {
-            if (m_StopFlag) return 0;
+            if (m_StopFlag.load(std::memory_order_acquire)) return 0;
 
             if (!m_CD->WriteRawGap())
             {

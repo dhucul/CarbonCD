@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include "logwindow.h"
 #include "cdwriter.h"
 #include "DirStructure.h"
@@ -10,6 +11,9 @@ class CWriteThread
 public:
     CWriteThread(void);
     ~CWriteThread(void);
+
+    CWriteThread(const CWriteThread&) = delete;
+    CWriteThread& operator=(const CWriteThread&) = delete;
     CLogWindow* m_LogWnd;
     CCDController* m_CD;
     CString m_CueFileName;
@@ -20,12 +24,12 @@ public:
     DWORD m_TotalFrames;
 
 protected:
-    HANDLE m_hThread;
-    DWORD m_ThreadID;
-    bool m_ModeMS;
+    HANDLE m_hThread = nullptr;
+    DWORD m_ThreadID = 0;
+    bool m_ModeMS = false;
 
 public:
-    bool m_StopFlag;
+    std::atomic_bool m_StopFlag{ false };
     void StartThread(void);
     void StopThread(void);
     DWORD ThreadFunction(void);
