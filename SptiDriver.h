@@ -2,7 +2,9 @@
 
 #include "Aspi.h"
 #include "PBBuffer.h"
-
+#ifndef SS_ERR
+#define SS_ERR 0x04
+#endif
 //   SPTI structures
 #define CTL_CODE( DeviceType, Function, Method, Access ) (                 \
         ((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method) \

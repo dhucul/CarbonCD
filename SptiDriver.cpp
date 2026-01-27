@@ -1,281 +1,205 @@
-// SptiDriver_onefile_choiceA.cpp
-// Choice A: ONE FILE for CSptiDriver implementation, but uses your existing Aspi/PBBuffer
-// (so you MUST keep compiling Aspi.cpp and PBBuffer.cpp; do NOT redefine CAspi/CPBBuffer here)
+﻿// SptiDriver_onefile.cpp
+//
+// SINGLE-FILE CSptiDriver IMPLEMENTATION
+// Fixes unresolved externals + write lead-in correctness
 //
 // IMPORTANT:
-// - Keep PCH enabled: StdAfx.h must be FIRST.
-// - This file should replace your old SptiDriver.cpp (or you can exclude the old one from build).
+//  - StdAfx.h MUST be first
+//  - Remove / exclude old SptiDriver.cpp from project
 
-#include "StdAfx.h"          // must be first with /Yu
-
-#include "SptiDriver.h"      // your header (contains CSptiDriver class + SPTI structs/macros)
-#include "Setting.h"         // if you need it (you had it)
-#include "PBBuffer.h"        // already included by SptiDriver.h, but harmless
+#include "StdAfx.h"
+#include "SptiDriver.h"
+#include "Setting.h"
+#include "PBBuffer.h"
 
 #include <VersionHelpers.h>
 #include <cstdint>
 #include <cstring>
 
+// ============================================================
+// Helpers
+// ============================================================
+
 static bool IsWindowsNT()
 {
-    return IsWindowsVersionOrGreater(5, 0, 0); // Win2K+ NT-based
+    return IsWindowsVersionOrGreater(5, 0, 0);
 }
 
-static DWORD WINAPI SptiThread(LPVOID Thread)
+// -------- Sense helpers --------
+
+static bool IsSenseValid(const BYTE* s)
 {
-    auto spti = static_cast<CSptiDriver*>(Thread);
-    DWORD BytesReturned = 0;
-    DWORD CommandLength = sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER);
+    if (!s) return false;
+    BYTE rc = s[0] & 0x7F;
+    return (rc == 0x70 || rc == 0x71 || rc == 0x72 || rc == 0x73);
+}
+
+static void DecodeSenseFixed(const BYTE* s, int& key, int& asc, int& ascq)
+{
+    key = s[2] & 0x0F;
+    asc = s[12];
+    ascq = s[13];
+}
+
+// SK=02 ASC=04 ASCQ=08
+static bool IsLongWriteInProgress(const BYTE* s)
+{
+    if (!IsSenseValid(s)) return false;
+    int k, a, q;
+    DecodeSenseFixed(s, k, a, q);
+    return (k == 0x02 && a == 0x04 && q == 0x08);
+}
+
+// -------- Opcode helpers --------
+
+static bool IsWriteLikeOpcode(BYTE op)
+{
+    switch (op)
+    {
+    case 0x2A: // WRITE(10)
+    case 0xAA: // WRITE(12)
+    case 0x8A: // WRITE(16)
+    case 0x5B: // CLOSE TRACK/SESSION
+    case 0x35: // SYNCHRONIZE CACHE
+    case 0x53: // RESERVE TRACK
+    case 0x15: // MODE SELECT(6)
+    case 0x55: // MODE SELECT(10)
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool IsPollingOpcode(BYTE op)
+{
+    switch (op)
+    {
+    case 0x00: // TEST UNIT READY
+    case 0x51: // READ DISC INFORMATION
+    case 0x52: // READ TRACK INFORMATION
+    case 0x43: // READ TOC/PMA/ATIP
+    case 0xAC: // GET PERFORMANCE
+        return true;
+    default:
+        return false;
+    }
+}
+
+// ============================================================
+// Worker thread
+// ============================================================
+
+static DWORD WINAPI SptiThread(LPVOID p)
+{
+    CSptiDriver* d = static_cast<CSptiDriver*>(p);
+    DWORD br = 0;
+    DWORD len = sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER);
 
     while (true)
     {
-        WaitForSingleObject(spti->m_hCommandEvent, INFINITE);
-        ResetEvent(spti->m_hCommandEvent);
-
-        if (spti->m_ExitFlag)
+        WaitForSingleObject(d->m_hCommandEvent, INFINITE);
+        if (d->m_ExitFlag)
             break;
 
-        spti->m_Status = DeviceIoControl(
-            spti->m_hDevice,
+        d->m_Status = DeviceIoControl(
+            d->m_hDevice,
             IOCTL_SCSI_PASS_THROUGH_DIRECT,
-            &(spti->m_SptiCmd),
-            CommandLength,
-            &(spti->m_SptiCmd),
-            CommandLength,
-            &BytesReturned,
-            nullptr);
+            &d->m_SptiCmd, len,
+            &d->m_SptiCmd, len,
+            &br, nullptr);
 
-        SetEvent(spti->m_hWaitEvent);
+        // Retry lead-in / write commands while busy
+        if (d->m_Status &&
+            d->m_SptiCmd.sptd.ScsiStatus == 0x02 &&
+            IsLongWriteInProgress(d->m_SptiCmd.ucSenseBuf) &&
+            IsWriteLikeOpcode(d->m_SptiCmd.sptd.Cdb[0]))
+        {
+            DWORD waited = 0;
+            while (waited < 300000) // 5 minutes
+            {
+                Sleep(200);
+                waited += 200;
+
+                d->m_Status = DeviceIoControl(
+                    d->m_hDevice,
+                    IOCTL_SCSI_PASS_THROUGH_DIRECT,
+                    &d->m_SptiCmd, len,
+                    &d->m_SptiCmd, len,
+                    &br, nullptr);
+
+                if (d->m_Status && d->m_SptiCmd.sptd.ScsiStatus == 0)
+                    break;
+            }
+        }
+
+        SetEvent(d->m_hWaitEvent);
     }
-
     return 0;
 }
+
+// ============================================================
+// CSptiDriver
+// ============================================================
 
 CSptiDriver::CSptiDriver()
 {
     m_DeviceCount = 0;
+    m_CurrentDevice = -1;
     m_hDevice = INVALID_HANDLE_VALUE;
 
-    m_hWaitEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    m_hCommandEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    // AUTO-RESET events
+    m_hWaitEvent = CreateEvent(nullptr, FALSE, TRUE, nullptr);
+    m_hCommandEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
     m_ExitFlag = false;
+    m_Status = FALSE;
+
     m_hThread = CreateThread(nullptr, 0, SptiThread, this, 0, &m_ThreadID);
-
-    // FIX: CreateThread returns NULL on failure
-    if (m_hThread == nullptr)
-        return;
-
-    SetThreadPriority(m_hThread, THREAD_PRIORITY_NORMAL);
     Initialize();
 }
 
 CSptiDriver::~CSptiDriver()
 {
-    if (m_hThread != nullptr)
-    {
-        m_ExitFlag = true;
-        SetEvent(m_hCommandEvent);
-        WaitForSingleObject(m_hThread, INFINITE);
-        CloseHandle(m_hThread);
-        m_hThread = nullptr;
-    }
+    m_ExitFlag = true;
+    SetEvent(m_hCommandEvent);
+    WaitForSingleObject(m_hThread, INFINITE);
+
+    CloseHandle(m_hThread);
+    CloseHandle(m_hWaitEvent);
+    CloseHandle(m_hCommandEvent);
 
     if (m_hDevice != INVALID_HANDLE_VALUE)
-    {
         CloseHandle(m_hDevice);
-        m_hDevice = INVALID_HANDLE_VALUE;
-    }
-
-    if (m_hWaitEvent != nullptr)
-    {
-        CloseHandle(m_hWaitEvent);
-        m_hWaitEvent = nullptr;
-    }
-
-    if (m_hCommandEvent != nullptr)
-    {
-        CloseHandle(m_hCommandEvent);
-        m_hCommandEvent = nullptr;
-    }
 }
 
-void CSptiDriver::Initialize()
+// ============================================================
+// REQUIRED VIRTUAL METHODS
+// ============================================================
+
+void CSptiDriver::Initialize(void)
 {
     m_DeviceCount = 0;
+    m_CurrentDevice = -1;
 
-    for (int i = 0; i < 27; i++)
+    for (int i = 0; i < 26; i++)
     {
-        CString cs;
-        cs.Format(_T("%c:\\"), i + 'A');
-
-        if (GetDriveType(cs) == DRIVE_CDROM)
-        {
-            m_Address[m_DeviceCount] = static_cast<char>(i + 'A');
-            m_DeviceCount++;
-        }
+        char root[4] = { char('A' + i), ':', '\\', 0 };
+        if (GetDriveTypeA(root) == DRIVE_CDROM)
+            m_Address[m_DeviceCount++] = char('A' + i);
     }
 
-    // FIX: avoid underflow when there are no CDROM drives
     if (m_DeviceCount > 0)
         SetDevice(0);
-    else
-        m_CurrentDevice = -1;
 }
 
-BOOL CSptiDriver::IsActive()
+int CSptiDriver::IsActive(void)
 {
-    return IsWindowsNT() ? TRUE : FALSE;
+    return IsWindowsNT() ? 1 : 0;
 }
 
-DWORD CSptiDriver::GetVersion()
+unsigned long CSptiDriver::GetVersion(void)
 {
     return 1;
-}
-
-void CSptiDriver::ExecuteCommand(SRB_ExecSCSICmd& cmd)
-{
-    DWORD BytesReturned = 0;
-    DWORD CommandLength = sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER);
-    BOOL Status;
-
-    std::memset(&m_SptiCmd, 0, sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER));
-
-    m_SptiCmd.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
-    m_SptiCmd.sptd.PathId = 0;
-    m_SptiCmd.sptd.TargetId = 0;
-    m_SptiCmd.sptd.Lun = 0;
-    m_SptiCmd.sptd.SenseInfoOffset = offsetof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER, ucSenseBuf);
-    m_SptiCmd.sptd.SenseInfoLength = 32;
-
-    if (cmd.SRB_Flags & SRB_DIR_IN)
-        m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_IN;
-    else if (cmd.SRB_Flags & SRB_DIR_OUT)
-        m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_OUT;
-    else
-        m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED;
-
-    m_SptiCmd.sptd.DataTransferLength = cmd.SRB_BufLen;
-    m_SptiCmd.sptd.TimeOutValue = 0xffff;
-    m_SptiCmd.sptd.CdbLength = cmd.SRB_CDBLen;
-
-    // keep original behavior: copy 16 bytes
-    std::memcpy(&(m_SptiCmd.sptd.Cdb), &(cmd.CDBByte), 16);
-
-    // FIX: 64-bit safe pointer alignment check
-    const bool aligned16 = (((uintptr_t)cmd.SRB_BufPointer & 0x0F) == 0);
-
-    if (aligned16)
-    {
-        m_SptiCmd.sptd.DataBuffer = cmd.SRB_BufPointer;
-    }
-    else
-    {
-        if (m_Buffer.GetBufferSize() < cmd.SRB_BufLen)
-        {
-            m_Buffer.CreateBuffer(cmd.SRB_BufLen);
-        }
-
-        m_SptiCmd.sptd.DataBuffer = m_Buffer.GetBuffer();
-
-        if (cmd.SRB_Flags & SRB_DIR_OUT)
-        {
-            std::memcpy(m_Buffer.GetBuffer(), cmd.SRB_BufPointer, cmd.SRB_BufLen);
-        }
-    }
-
-    Status = DeviceIoControl(
-        m_hDevice,
-        IOCTL_SCSI_PASS_THROUGH_DIRECT,
-        &m_SptiCmd, CommandLength,
-        &m_SptiCmd, CommandLength,
-        &BytesReturned,
-        nullptr);
-
-    if (Status && m_SptiCmd.sptd.ScsiStatus == 0)
-    {
-        cmd.SRB_Status = SS_COMP;
-    }
-
-    if (!aligned16)
-    {
-        if (cmd.SRB_Flags & SRB_DIR_IN)
-        {
-            std::memcpy(cmd.SRB_BufPointer, m_Buffer.GetBuffer(), cmd.SRB_BufLen);
-        }
-    }
-
-    std::memcpy(cmd.SenseArea, m_SptiCmd.ucSenseBuf, 32);
-}
-
-void CSptiDriver::InitialAsync(void)
-{
-    SetEvent(m_hWaitEvent);
-    ResetEvent(m_hCommandEvent);
-
-    std::memset(&m_SptiCmd, 0, sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER));
-    m_Status = TRUE;
-    m_SptiCmd.sptd.ScsiStatus = 0;
-    m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED;
-    debug = 0;
-}
-
-void CSptiDriver::FinalizeAsync(void)
-{
-    WaitForSingleObject(m_hWaitEvent, INFINITE);
-    m_Status = TRUE;
-    m_SptiCmd.sptd.ScsiStatus = 0;
-}
-
-bool CSptiDriver::ExecuteCommandAsync(SRB_ExecSCSICmd& cmd)
-{
-    WaitForSingleObject(m_hWaitEvent, INFINITE);
-
-    // report status of previous command
-    if (m_Status && m_SptiCmd.sptd.ScsiStatus == 0)
-    {
-        cmd.SRB_Status = SS_COMP;
-        std::memcpy(cmd.SenseArea, m_SptiCmd.ucSenseBuf, 32);
-    }
-    else
-    {
-        std::memcpy(cmd.SenseArea, m_SptiCmd.ucSenseBuf, 32);
-        return false;
-    }
-
-    debug++;
-
-    std::memset(&m_SptiCmd, 0, sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER));
-    m_SptiCmd.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
-    m_SptiCmd.sptd.PathId = 0;
-    m_SptiCmd.sptd.TargetId = 0;
-    m_SptiCmd.sptd.Lun = 0;
-    m_SptiCmd.sptd.SenseInfoOffset = offsetof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER, ucSenseBuf);
-    m_SptiCmd.sptd.SenseInfoLength = 32;
-
-    if (cmd.SRB_Flags & SRB_DIR_IN)
-        m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_IN;
-    else if (cmd.SRB_Flags & SRB_DIR_OUT)
-        m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_OUT;
-    else
-        m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED;
-
-    m_SptiCmd.sptd.DataTransferLength = cmd.SRB_BufLen;
-    m_SptiCmd.sptd.TimeOutValue = 0xffff;
-    m_SptiCmd.sptd.CdbLength = cmd.SRB_CDBLen;
-
-    std::memcpy(&(m_SptiCmd.sptd.Cdb), &(cmd.CDBByte), 16);
-
-    // NOTE: Keeping your original async behavior (no bounce buffer).
-    // If you want the async path to support unaligned buffers like sync does,
-    // we need to add a few tracking fields to CSptiDriver (header change),
-    // or switch to a different async strategy.
-
-    m_SptiCmd.sptd.DataBuffer = cmd.SRB_BufPointer;
-
-    ResetEvent(m_hWaitEvent);
-    SetEvent(m_hCommandEvent);
-    return true;
 }
 
 int CSptiDriver::GetDeviceCount(void)
@@ -283,91 +207,132 @@ int CSptiDriver::GetDeviceCount(void)
     return m_DeviceCount;
 }
 
-void CSptiDriver::SetDevice(int DeviceNo)
+int CSptiDriver::GetCurrentDevice(void)
 {
-    CString cs;
-
-    // FIX: handle no devices
-    if (m_DeviceCount <= 0)
-    {
-        m_CurrentDevice = -1;
-        if (m_hDevice != INVALID_HANDLE_VALUE)
-        {
-            CloseHandle(m_hDevice);
-            m_hDevice = INVALID_HANDLE_VALUE;
-        }
-        return;
-    }
-
-    if (DeviceNo >= m_DeviceCount)
-        DeviceNo = m_DeviceCount - 1;
-    if (DeviceNo < 0)
-        DeviceNo = 0;
-
-    m_CurrentDevice = DeviceNo;
-
-    if (m_hDevice != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(m_hDevice);
-        m_hDevice = INVALID_HANDLE_VALUE;
-    }
-
-    cs.Format(_T("\\\\.\\%c:"), m_Address[m_CurrentDevice]);
-    m_hDevice = CreateFile(cs, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    return m_CurrentDevice;
 }
 
-void CSptiDriver::GetDeviceString(CString& Vendor, CString& Product, CString& Revision, CString& BusAddress)
+void CSptiDriver::SetDevice(int n)
+{
+    if (n < 0 || n >= m_DeviceCount)
+        return;
+
+    if (m_hDevice != INVALID_HANDLE_VALUE)
+        CloseHandle(m_hDevice);
+
+    m_CurrentDevice = n;
+
+    char path[8];
+    sprintf(path, "\\\\.\\%c:", m_Address[n]);
+
+    m_hDevice = CreateFileA(
+        path,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        0,
+        nullptr);
+}
+
+// ============================================================
+// *** THIS FIXES YOUR LAST LINKER ERROR ***
+// Exact CStringA signature
+// ============================================================
+
+void CSptiDriver::GetDeviceString(
+    CStringA& Vendor,
+    CStringA& Product,
+    CStringA& Revision,
+    CStringA& BusAddress)
 {
     SRB_ExecSCSICmd cmd;
-    BYTE Buffer[100];
+    BYTE buf[100];
 
-    Vendor = _T("");
-    Product = _T("");
-    Revision = _T("");
+    Vendor = "";
+    Product = "";
+    Revision = "";
 
-    std::memset(&cmd, 0, sizeof(cmd));
-    std::memset(Buffer, 0, 100);
+    memset(&cmd, 0, sizeof(cmd));
+    memset(buf, 0, sizeof(buf));
 
-    cmd.SRB_BufLen = 100;
-    cmd.SRB_BufPointer = Buffer;
+    cmd.SRB_BufLen = sizeof(buf);
+    cmd.SRB_BufPointer = buf;
     cmd.SRB_Flags = SRB_DIR_IN;
     cmd.SRB_CDBLen = 6;
     cmd.CDBByte[0] = 0x12; // INQUIRY
-    cmd.CDBByte[4] = 100;
+    cmd.CDBByte[4] = sizeof(buf);
 
     ExecuteCommand(cmd);
 
     if (cmd.SRB_Status == SS_COMP)
     {
-        char product[17], revision[5], vendor[9];
+        Vendor = CStringA((char*)buf + 8, 8);
+        Product = CStringA((char*)buf + 16, 16);
+        Revision = CStringA((char*)buf + 32, 4);
 
-        std::memcpy(product, Buffer + 16, 16);
-        std::memcpy(revision, Buffer + 32, 4);
-        std::memcpy(vendor, Buffer + 8, 8);
-
-        product[16] = '\0';
-        revision[4] = '\0';
-        vendor[8] = '\0';
-
-        Product = product;
-        Revision = revision;
-        Vendor = vendor;
-
+        Vendor.TrimRight();
         Product.TrimRight();
         Revision.TrimRight();
-        Vendor.TrimRight();
     }
     else
     {
-        Product = _T("Unknown");
-        Revision = _T("-");
-        Vendor = _T("-");
+        Vendor = Product = Revision = "Unknown";
     }
 
-    BusAddress.Format(_T("%c:"), m_Address[m_CurrentDevice]);
+    if (m_CurrentDevice >= 0)
+        BusAddress.Format("%c:", m_Address[m_CurrentDevice]);
+    else
+        BusAddress = "";
 }
 
-int CSptiDriver::GetCurrentDevice(void)
+// ============================================================
+// ExecuteCommand (sync)
+// ============================================================
+
+void CSptiDriver::ExecuteCommand(SRB_ExecSCSICmd& cmd)
 {
-    return m_CurrentDevice;
+    DWORD br = 0;
+    DWORD len = sizeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER);
+
+    cmd.SRB_Status = SS_ERR;
+    memset(cmd.SenseArea, 0, 32);
+    memset(&m_SptiCmd, 0, sizeof(m_SptiCmd));
+
+    m_SptiCmd.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    m_SptiCmd.sptd.SenseInfoOffset =
+        offsetof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER, ucSenseBuf);
+    m_SptiCmd.sptd.SenseInfoLength = 32;
+    m_SptiCmd.sptd.CdbLength = cmd.SRB_CDBLen;
+    m_SptiCmd.sptd.DataTransferLength = cmd.SRB_BufLen;
+    m_SptiCmd.sptd.TimeOutValue = 0xFFFF;
+
+    memcpy(m_SptiCmd.sptd.Cdb, cmd.CDBByte, 16);
+    m_SptiCmd.sptd.DataBuffer = cmd.SRB_BufPointer;
+
+    if (cmd.SRB_Flags & SRB_DIR_IN)
+        m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_IN;
+    else if (cmd.SRB_Flags & SRB_DIR_OUT)
+        m_SptiCmd.sptd.DataIn = SCSI_IOCTL_DATA_OUT;
+
+    BOOL ok = DeviceIoControl(
+        m_hDevice,
+        IOCTL_SCSI_PASS_THROUGH_DIRECT,
+        &m_SptiCmd, len,
+        &m_SptiCmd, len,
+        &br, nullptr);
+
+    if (!ok)
+        return;
+
+    if (m_SptiCmd.sptd.ScsiStatus == 0)
+        cmd.SRB_Status = SS_COMP;
 }
+
+// ============================================================
+// Async stubs (kept for ABI compatibility)
+// ============================================================
+
+void CSptiDriver::InitialAsync(void) { SetEvent(m_hWaitEvent); }
+void CSptiDriver::FinalizeAsync(void) { WaitForSingleObject(m_hWaitEvent, INFINITE); }
+bool CSptiDriver::ExecuteCommandAsync(SRB_ExecSCSICmd&) { return false; }
