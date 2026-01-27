@@ -279,7 +279,7 @@ void CIsoCreator::CreatePVD(BYTE* pvd)
     pvd[0x006] = 1;
     pvd[0x007] = 0;
     memset(pvd + 0x008, 0x20, 0x20);
-    sprintf((char*)(pvd + 0x28), "%-30s", static_cast<LPCSTR>(m_VolumeLabel));
+    snprintf((char*)(pvd + 0x28), 31, "%-30s", static_cast<LPCSTR>(m_VolumeLabel));
     *((DWORD*)(pvd + 0x50)) = m_ImageSize;
     *((DWORD*)(pvd + 0x54)) = LeToBe(m_ImageSize);
     *((WORD*)(pvd + 0x78)) = 1;
@@ -483,7 +483,7 @@ void CIsoCreator::SetDate(BYTE* Buffer, SYSTEMTIME& Time)
 
 void CIsoCreator::SetDate_L(BYTE* Buffer, SYSTEMTIME& Time)
 {
-    sprintf((char*)Buffer, "%04d%02d%02d%02d%02d%02d%02d",
+    snprintf((char*)Buffer, 17, "%04d%02d%02d%02d%02d%02d%02d",
             Time.wYear, Time.wMonth, Time.wDay,
             Time.wHour, Time.wMinute, Time.wSecond,
             Time.wMilliseconds / 10);
@@ -509,7 +509,7 @@ void CIsoCreator::WriteBuffer(BYTE* Buffer, int Size)
     {
         if (m_BufferSize + Size > 2048)
         {
-            memset(m_Buffer + m_BufferSize, 0, Size);
+            memset(m_Buffer + m_BufferSize, 0, 2048 - m_BufferSize);
             m_Writer.WriteHeader(m_Buffer);
             m_BufferSize = 0;
         }

@@ -49,7 +49,7 @@ bool CCDWriter::ParseCueSheetFile(LPCSTR FileName)
     DWORD FileSize;
     DWORD read;
     //   split dir name
-    strcpy(Path, FileName);
+    strncpy_s(Path, sizeof(Path), FileName, _TRUNCATE);
     q = Path;
     p = Path;
 
@@ -81,11 +81,11 @@ bool CCDWriter::ParseCueSheetFile(LPCSTR FileName)
     if (!m_CueSheetParser.Parse(p, Path, 0))
     {
         m_ErrorMessage.Format(MSG(2), m_CueSheetParser.GetErrorMessage());
-        delete p;
+        delete[] p;
         return false;
     }
 
-    delete p;
+    delete[] p;
     return true;
 }
 

@@ -365,7 +365,7 @@ void CDirStructure::CalcShortName(CWnd* ParentWnd)
         {
             LPSTR q;
             char Buffer[2048];
-            strcpy(Buffer, p->m_ImageFileNameShort);
+            strncpy_s(Buffer, sizeof(Buffer), p->m_ImageFileNameShort, _TRUNCATE);
             q = Buffer + lstrlen(Buffer);
 
             while (q > Buffer)
@@ -438,7 +438,7 @@ void CDirStructure::CalcShortName(CWnd* ParentWnd)
             char Buffer[2048];
             CString OldName, cs, a, b;
             OldName = p->m_ImageFileName;
-            strcpy(Buffer, p->m_ImageFileName);
+            strncpy_s(Buffer, sizeof(Buffer), p->m_ImageFileName, _TRUNCATE);
             q = Buffer + lstrlen(Buffer);
 
             while (q > Buffer)
