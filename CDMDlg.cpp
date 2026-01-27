@@ -1,3 +1,5 @@
+// CDMDlg.cpp (updated single-file version; no header changes required)
+
 #include "stdafx.h"
 #include "Resource.h"
 #include "CDM.h"
@@ -20,8 +22,26 @@
 #include "Mmsystem.h"
 
 #ifdef _DEBUG
-    #define new DEBUG_NEW
+#define new DEBUG_NEW
 #endif
+
+// Helpers (file-local; no header changes required)
+static void SetWindowPosFromRect(CWnd* wnd, const RECT& r, const CWnd* pInsertAfter, UINT flags)
+{
+    if (!wnd) return;
+    const int w = r.right - r.left;
+    const int h = r.bottom - r.top;
+    wnd->SetWindowPos(pInsertAfter, r.left, r.top, w, h, flags);
+}
+
+static CString ReplaceExtensionSafe(const CString& path, LPCTSTR newExtWithDot)
+{
+    CString base = path;
+    const int dot = base.ReverseFind(_T('.'));
+    if (dot > 0)
+        base = base.Left(dot);
+    return base + newExtWithDot;
+}
 
 class CAboutDlg : public CDialog
 {
@@ -42,7 +62,7 @@ public:
 };
 
 CAboutDlg::CAboutDlg() : CDialog(IDD)
-                         , m_VerString(_T(""))
+, m_VerString(_T(""))
 {
 }
 
@@ -58,7 +78,7 @@ BOOL CAboutDlg::OnInitDialog()
     m_VerString.Format("Version %s", APP_VERSION);
     SetWindowText(theSetting.m_Lang.m_Str[LP_ABOUT + 0]);
     this->SetDlgItemText(IDC_SUBTITLE, theSetting.m_Lang.m_Str[LP_ABOUT + 1]);
-    this->SetDlgItemText(IDC_AUTHOR, "Copyright © 2015 Rizonesoft");
+    this->SetDlgItemText(IDC_AUTHOR, "Copyright (C) 2015 Rizonesoft");
     SetDlgItemText(IDOK, theSetting.m_Lang.m_Str[1]);
     UpdateData(FALSE);
     return TRUE; // return TRUE unless you set the focus to a control
@@ -69,7 +89,7 @@ END_MESSAGE_MAP()
 
 CCDMDlg::CCDMDlg(CWnd* pParent /*=NULL*/)
     : CDialog(IDD, pParent)
-      , m_Message(_T(""))
+    , m_Message(_T(""))
 {
     m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
     m_TocWnd = nullptr;
@@ -133,7 +153,7 @@ END_MESSAGE_MAP()
 BOOL CCDMDlg::OnInitDialog()
 {
     CDialog::OnInitDialog();
-    ASSERT(( IDM_ABOUTBOX & 0xFFF0 ) == IDM_ABOUTBOX);
+    ASSERT((IDM_ABOUTBOX & 0xFFF0) == IDM_ABOUTBOX);
     ASSERT(IDM_ABOUTBOX < 0xF000);
     CMenu* pSysMenu = GetSystemMenu(FALSE);
 
@@ -154,21 +174,27 @@ BOOL CCDMDlg::OnInitDialog()
     InitializeControlls();
     InitializeButtons();
     OnCbnSelchangeDrivelist();
+
+    // Guard against null (LoadFrame failure etc.)
+    ASSERT(m_TocWnd && m_LogWnd);
+    if (!m_TocWnd || !m_LogWnd)
+    {
+        EndDialog(IDCANCEL);
+        return FALSE;
+    }
+
     m_TocWnd->m_CD = &m_CD;
-    m_TocWnd->SetWindowPos(&wndTop,
-                           theSetting.m_TocWnd.left, theSetting.m_TocWnd.top,
-                           theSetting.m_TocWnd.right, theSetting.m_TocWnd.bottom,
-                           SWP_NOZORDER);
+
+    // FIX: SetWindowPos expects width/height, not right/bottom coordinates
+    SetWindowPosFromRect(m_TocWnd, theSetting.m_TocWnd, &wndTop, SWP_NOZORDER);
 
     if (theSetting.m_ShowTocWnd)
     {
         m_TocWnd->ShowWindow(SW_SHOW);
     }
 
-    m_LogWnd->SetWindowPos(&wndTop,
-                           theSetting.m_LogWnd.left, theSetting.m_LogWnd.top,
-                           theSetting.m_LogWnd.right, theSetting.m_LogWnd.bottom,
-                           SWP_NOZORDER);
+    // FIX: SetWindowPos expects width/height, not right/bottom coordinates
+    SetWindowPosFromRect(m_LogWnd, theSetting.m_LogWnd, &wndTop, SWP_NOZORDER);
 
     if (theSetting.m_ShowLogWnd)
     {
@@ -214,10 +240,9 @@ BOOL CCDMDlg::OnInitDialog()
         if (m_CD.GetAspiCtrl()->IsActive())
         {
             m_LogWnd->AddMessage(LOG_NORMAL, cs);
-            DWORD Version;
-            Version = m_CD.GetAspiCtrl()->GetVersion();
+            DWORD Version = m_CD.GetAspiCtrl()->GetVersion(); // FIX: initialize directly
             cs.Format("ASPI version:%d.%d.%d.%d", Version & 0xff, (Version >> 8) & 0xff, (Version >> 16) & 0xff,
-                      Version >> 24);
+                Version >> 24);
             m_LogWnd->AddMessage(LOG_INFO, cs);
         }
 
@@ -301,7 +326,6 @@ void CCDMDlg::OnPaint()
     }
 }
 
-
 HCURSOR CCDMDlg::OnQueryDragIcon()
 {
     return m_hIcon;
@@ -353,12 +377,13 @@ void CCDMDlg::OnClose()
 
 void CCDMDlg::OnViewToc()
 {
-    if (m_TocWnd->GetStyle() & 0x10000000)
+    // FIX: use WS_VISIBLE instead of magic number 0x10000000
+    if (m_TocWnd && (m_TocWnd->GetStyle() & WS_VISIBLE))
     {
         m_TocWnd->ShowWindow(SW_HIDE);
     }
 
-    else
+    else if (m_TocWnd)
     {
         m_TocWnd->ShowWindow(SW_SHOW);
     }
@@ -440,12 +465,13 @@ void CCDMDlg::OnToolCreateimage()
 
 void CCDMDlg::OnViewLog()
 {
-    if (m_LogWnd->GetStyle() & 0x10000000)
+    // FIX: use WS_VISIBLE instead of magic number 0x10000000
+    if (m_LogWnd && (m_LogWnd->GetStyle() & WS_VISIBLE))
     {
         m_LogWnd->ShowWindow(SW_HIDE);
     }
 
-    else
+    else if (m_LogWnd)
     {
         m_LogWnd->ShowWindow(SW_SHOW);
     }
@@ -526,10 +552,9 @@ void CCDMDlg::OnGeneralSetting()
             if (m_CD.GetAspiCtrl()->IsActive())
             {
                 m_LogWnd->AddMessage(LOG_NORMAL, cs);
-                DWORD Version;
-                Version = m_CD.GetAspiCtrl()->GetVersion();
+                DWORD Version = m_CD.GetAspiCtrl()->GetVersion(); // FIX: initialize directly
                 cs.Format("ASPI version:%d.%d.%d.%d", Version & 0xff, (Version >> 8) & 0xff, (Version >> 16) & 0xff,
-                          Version >> 24);
+                    Version >> 24);
                 m_LogWnd->AddMessage(LOG_INFO, cs);
             }
 
@@ -769,24 +794,17 @@ void CCDMDlg::OnCdDuplicate()
 
     if (MessageBox(MSG(81), CONF_MSG, MB_YESNO) == IDYES)
     {
-        char BinFile[512];
-        char SubFile[512];
-        char PreFile[512];
-        char CueFile[512];
-        //   create .bin file name
-        lstrcpy(PreFile, Dlg.m_ImageName);
-        lstrcpy(SubFile, Dlg.m_ImageName);
-        lstrcpy(CueFile, Dlg.m_ImageName);
-        lstrcpy(BinFile, Dlg.m_ImageName);
-        lstrcpy(PreFile + lstrlen(BinFile) - 4, ".pre");
-        lstrcpy(SubFile + lstrlen(BinFile) - 4, ".sub");
-        lstrcpy(CueFile + lstrlen(BinFile) - 4, ".cue");
-        lstrcpy(BinFile + lstrlen(BinFile) - 4, ".img");
-        DeleteFile(Dlg.m_ImageName); //   delete .cdm file
-        DeleteFile(BinFile); //   delete .img file
-        DeleteFile(SubFile); //   delete .sub file
-        DeleteFile(PreFile); //   delete .pre file
-        DeleteFile(CueFile); //   delete .cue file
+        // FIX: safer filename handling (no fixed-size buffers, handles short names)
+        const CString imgFile = ReplaceExtensionSafe(Dlg.m_ImageName, _T(".img"));
+        const CString subFile = ReplaceExtensionSafe(Dlg.m_ImageName, _T(".sub"));
+        const CString preFile = ReplaceExtensionSafe(Dlg.m_ImageName, _T(".pre"));
+        const CString cueFile = ReplaceExtensionSafe(Dlg.m_ImageName, _T(".cue"));
+
+        DeleteFile(Dlg.m_ImageName); // delete .cdm file
+        DeleteFile(imgFile);         // delete .img file
+        DeleteFile(subFile);         // delete .sub file
+        DeleteFile(preFile);         // delete .pre file
+        DeleteFile(cueFile);         // delete .cue file
     }
 }
 
@@ -808,13 +826,14 @@ void CCDMDlg::OnLanguage()
         m_TocWnd->SetLanguage();
         m_LogWnd->SetLanguage();
 
-        if (m_TocWnd->GetStyle() & 0x10000000)
+        // FIX: use WS_VISIBLE instead of magic number 0x10000000
+        if (m_TocWnd->GetStyle() & WS_VISIBLE)
         {
             m_TocWnd->ShowWindow(SW_HIDE);
             m_TocWnd->ShowWindow(SW_SHOW);
         }
 
-        if (m_LogWnd->GetStyle() & 0x10000000)
+        if (m_LogWnd->GetStyle() & WS_VISIBLE)
         {
             m_LogWnd->ShowWindow(SW_HIDE);
             m_LogWnd->ShowWindow(SW_SHOW);
@@ -843,8 +862,8 @@ void CCDMDlg::InitializeButtons(void)
 
         if (bmp.m_hObject != nullptr)
         {
-            CDC *pDC, SkinDC, BmpDC;
-            CBitmap *Tmp1, *Tmp2;
+            CDC* pDC, SkinDC, BmpDC;
+            CBitmap* Tmp1, * Tmp2;
             pDC = GetDC();
             SkinDC.CreateCompatibleDC(pDC);
             BmpDC.CreateCompatibleDC(pDC);
@@ -904,6 +923,7 @@ void CCDMDlg::InitializeButtons(void)
     m_ExitButton.SetBitmap(static_cast<HBITMAP>(m_ExitBmp.m_hObject));
 }
 
+// Kept original signature to avoid header changes
 void CCDMDlg::ViewMessage(LPCSTR Message)
 {
     if (m_Message != Message)
@@ -997,7 +1017,8 @@ void CCDMDlg::OnMove(int x, int y)
 {
     CDialog::OnMove(x, y);
 
-    if (GetStyle() & 0x10000000)
+    // FIX: use WS_VISIBLE instead of magic number 0x10000000
+    if (GetStyle() & WS_VISIBLE)
     {
         RECT r;
         GetWindowRect(&r);
@@ -1055,7 +1076,7 @@ void CCDMDlg::SetLanguage(void)
         for (i = 0; i < 17; i++)
         {
             GetMenu()->ModifyMenu(MenuString[i][0], MF_BYCOMMAND | MF_STRING, MenuString[i][0],
-                                  theSetting.m_Lang.m_Str[LP_MAINMENU + MenuString[i][1]]);
+                theSetting.m_Lang.m_Str[LP_MAINMENU + MenuString[i][1]]);
         }
 
         SetWindowText(theSetting.m_Lang.m_Str[LP_MAIN + 0]);
@@ -1086,7 +1107,6 @@ void CCDMDlg::WinHelp(DWORD dwData, UINT nCmd)
     OnHelpHelp();
     CDialog::WinHelp(dwData, nCmd);
 }
-
 
 void CCDMDlg::OnBnClickedCdRecognize()
 {

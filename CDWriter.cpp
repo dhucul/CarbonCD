@@ -2,9 +2,17 @@
 #include "cdwriter.h"
 #include "Setting.h"
 
+// Fixes applied:
+//  - delete[] vs delete for file buffer
+//  - safer path split (no overflow) + handles no-backslash case
+//  - validates GetFileSize / ReadFile
+//  - fixes WriteRawGap() reading m_WriteBuffer[2352] after zeroing only 2352 bytes
+//  - removes unreachable return
+//  - fixes suspicious static_cast<int> -> static_cast<DWORD> for lba
+
 CCDWriter::CCDWriter(void)
 {
-    //   create scramble table
+    // create scramble table
     {
         int i, j;
         WORD Counter;
@@ -41,31 +49,49 @@ void CCDWriter::Initialize(CAspi* aspi)
     m_MMCWriter.Initialize(aspi);
 }
 
+static void SplitDirFromPathSafe(LPCSTR fileName, char* outDir, size_t outDirSize)
+{
+    if (!outDir || outDirSize == 0)
+        return;
+
+    outDir[0] = '\0';
+    if (!fileName || !*fileName)
+        return;
+
+#if defined(_MSC_VER)
+    // Copy full path into outDir (truncated safely)
+    strncpy_s(outDir, outDirSize, fileName, _TRUNCATE);
+#else
+    // Fallback: ensure null-termination
+    strncpy(outDir, fileName, outDirSize - 1);
+    outDir[outDirSize - 1] = '\0';
+#endif
+
+    // Find last backslash
+    char* lastSlash = nullptr;
+    for (char* it = outDir; *it != '\0'; ++it)
+    {
+        if (*it == '\\')
+            lastSlash = it;
+    }
+
+    if (lastSlash)
+        *lastSlash = '\0';     // keep directory portion
+    else
+        outDir[0] = '\0';      // no directory component
+}
+
 bool CCDWriter::ParseCueSheetFile(LPCSTR FileName)
 {
     HANDLE hFile;
-    LPSTR p, q;
     char Path[512];
     DWORD FileSize;
-    DWORD read;
-    //   split dir name
-    strcpy(Path, FileName);
-    q = Path;
-    p = Path;
+    DWORD read = 0;
 
-    while (*q != '\0')
-    {
-        if (*q == '\\')
-        {
-            p = q;
-        }
+    // split dir name safely
+    SplitDirFromPathSafe(FileName, Path, sizeof(Path));
 
-        q++;
-    }
-
-    *p = '\0';
     hFile = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-
     if (hFile == INVALID_HANDLE_VALUE)
     {
         m_ErrorMessage.Format(MSG(1));
@@ -73,19 +99,35 @@ bool CCDWriter::ParseCueSheetFile(LPCSTR FileName)
     }
 
     FileSize = GetFileSize(hFile, nullptr);
-    p = new char[FileSize + 1];
-    ReadFile(hFile, p, FileSize, &read, nullptr);
-    p[FileSize] = '\0';
-    CloseHandle(hFile);
-
-    if (!m_CueSheetParser.Parse(p, Path, 0))
+    if (FileSize == INVALID_FILE_SIZE)
     {
-        m_ErrorMessage.Format(MSG(2), m_CueSheetParser.GetErrorMessage());
-        delete p;
+        CloseHandle(hFile);
+        m_ErrorMessage = "Failed to get file size.";
         return false;
     }
 
-    delete p;
+    char* buf = new char[FileSize + 1];
+
+    BOOL ok = ReadFile(hFile, buf, FileSize, &read, nullptr);
+    CloseHandle(hFile);
+
+    if (!ok || read != FileSize)
+    {
+        delete[] buf;
+        m_ErrorMessage = "Failed to read cue sheet file.";
+        return false;
+    }
+
+    buf[FileSize] = '\0';
+
+    if (!m_CueSheetParser.Parse(buf, Path, 0))
+    {
+        m_ErrorMessage.Format(MSG(2), m_CueSheetParser.GetErrorMessage());
+        delete[] buf;
+        return false;
+    }
+
+    delete[] buf;
     return true;
 }
 
@@ -96,7 +138,6 @@ bool CCDWriter::ParseCueSheet(LPCSTR CueSheet, DWORD ImageSize)
         m_ErrorMessage.Format(MSG(2), m_CueSheetParser.GetErrorMessage());
         return false;
     }
-
     return true;
 }
 
@@ -107,37 +148,30 @@ LPCSTR CCDWriter::GetErrorMessage(void)
 
 bool CCDWriter::StartWriting(bool ModeMS)
 {
-    //   clear counter
+    // clear counter
     m_LeadInCounter = 450000;
 
     if (ModeMS)
     {
         m_MMCWriter.PreventMediaRemoval(true);
     }
-
     else
     {
-        //   create cue-sheet as MMC format
+        // create cue-sheet as MMC format
         m_CueSheetParser.CreateMMCCueSheet(m_MMCWriter.GetLeadInLBA());
         m_SubCode.SetCueSheet(m_CueSheetParser.GetMMCCueSheet(), m_CueSheetParser.GetEntryCount());
         m_MMCWriter.PreventMediaRemoval(true);
 
         if ((*(m_CueSheetParser.GetMMCCueSheet()) & 0xf0) == 0)
-        {
             m_LeadInMode = false;
-        }
-
         else
-        {
             m_LeadInMode = true;
-        }
 
         m_DataMode = m_CueSheetParser.GetDataMode();
 
         if (m_WritingMode == WRITEMODE_2048)
         {
             BYTE Buffer[36];
-
             if (!m_MMCWriter.ReadTrackInfo(Buffer))
             {
                 m_ErrorMessage = "Failed to read track info.";
@@ -161,9 +195,7 @@ void CCDWriter::FinishWriting(void)
     m_MMCWriter.FlushBuffer();
 
     while (m_MMCWriter.TestUnitReady() == 2)
-    {
         Sleep(1000);
-    }
 
     m_MMCWriter.PreventMediaRemoval(false);
     m_MMCWriter.ReWind();
@@ -174,9 +206,7 @@ void CCDWriter::AbortWriting(void)
     m_MMCWriter.FlushBuffer();
 
     while (m_MMCWriter.TestUnitReady() == 2)
-    {
         Sleep(1000);
-    }
 
     m_MMCWriter.PreventMediaRemoval(false);
     m_MMCWriter.ReWind();
@@ -190,7 +220,7 @@ DWORD CCDWriter::GetLeadInSize(void)
 void CCDWriter::Sub16To96(BYTE* Buffer)
 {
     BYTE Sub16[16];
-    BYTE Mask, *p;
+    BYTE Mask, * p;
     int i;
     memcpy(Sub16, Buffer, 16);
     Mask = Sub16[15];
@@ -211,12 +241,12 @@ void CCDWriter::Sub16To96(BYTE* Buffer)
     }
 }
 
-//   ƒf[ƒ^Ä‚«—pƒƒ\ƒbƒh
 bool CCDWriter::WriteRaw(BYTE* Buffer)
 {
     DWORD lba;
     bool ret;
-    lba = m_SubCode.GenerateSub16(m_WriteBuffer + 2352);
+
+    lba = static_cast<DWORD>(m_SubCode.GenerateSub16(m_WriteBuffer + 2352));
     memcpy(m_WriteBuffer, Buffer, 2352);
 
     if (m_WritingMode == WRITEMODE_RAW_96 || m_WritingMode == WRITEMODE_RAW_P96)
@@ -225,32 +255,23 @@ bool CCDWriter::WriteRaw(BYTE* Buffer)
         Sub16To96(m_WriteBuffer + 2352);
         ret = m_MMCWriter.WriteBuffering(m_WriteBuffer, lba - 150);
     }
-
     else if (m_WritingMode == WRITEMODE_RAW_16)
     {
         Scramble(m_WriteBuffer);
         ret = m_MMCWriter.WriteBuffering(m_WriteBuffer, lba - 150);
     }
-
     else
     {
         if ((m_WriteBuffer[2352] & 0xf0) == 0x00)
         {
-            //   audio track
             ret = m_MMCWriter.WriteBuffering(m_WriteBuffer, lba - 150);
         }
-
         else
         {
             if (m_DataMode == 1)
-            {
                 ret = m_MMCWriter.WriteBufferingEx(m_WriteBuffer + 16, lba - 150, 2048);
-            }
-
             else
-            {
                 ret = m_MMCWriter.WriteBufferingEx(m_WriteBuffer + 16 + 8, lba - 150, 2048);
-            }
         }
     }
 
@@ -265,12 +286,10 @@ bool CCDWriter::WriteRaw96(BYTE* Buffer, DWORD lba)
 bool CCDWriter::WriteRawLeadIn(void)
 {
     DWORD lba;
-    lba = static_cast<int>(m_SubCode.GenerateSub16(m_WriteBuffer + 2352));
+    lba = static_cast<DWORD>(m_SubCode.GenerateSub16(m_WriteBuffer + 2352));
 
     if (m_WritingMode == WRITEMODE_2048)
-    {
         return true;
-    }
 
     GenerateZeroAreaLeadIn(m_WriteBuffer, lba);
     m_LeadInCounter++;
@@ -291,7 +310,9 @@ bool CCDWriter::WriteRawLeadIn(void)
 bool CCDWriter::WriteRawGap(void)
 {
     DWORD lba;
-    lba = static_cast<int>(m_SubCode.GenerateSub16(m_WriteBuffer + 2352));
+    lba = static_cast<DWORD>(m_SubCode.GenerateSub16(m_WriteBuffer + 2352));
+
+    // Build a proper gap sector (data + subcode) for raw modes
     GenerateZeroArea(m_WriteBuffer, lba);
 
     if (m_WritingMode == WRITEMODE_RAW_96 || m_WritingMode == WRITEMODE_RAW_P96)
@@ -303,19 +324,19 @@ bool CCDWriter::WriteRawGap(void)
     {
         return m_MMCWriter.WriteBuffering(m_WriteBuffer, lba - 150);
     }
+
+    // Non-raw modes: decide based on the subcode header BEFORE clearing data area.
+    const bool isAudio = ((m_WriteBuffer[2352] & 0xf0) == 0x00);
+
+    // Clear user data area
     memset(m_WriteBuffer, 0, 2352);
 
-    if ((m_WriteBuffer[2352] & 0xf0) == 0x00)
-    {
-        //   audio track
+    if (isAudio)
         return m_MMCWriter.WriteBuffering(m_WriteBuffer, lba - 150);
-    }
-    return m_MMCWriter.WriteBufferingEx(m_WriteBuffer + 16, lba - 150, 2048);
 
-    return false;
+    return m_MMCWriter.WriteBufferingEx(m_WriteBuffer + 16, lba - 150, 2048);
 }
 
-//  performing optimize power calibration
 bool CCDWriter::OPC(void)
 {
     return m_MMCWriter.PerformPowerCalibration();
@@ -333,9 +354,7 @@ bool CCDWriter::LoadTray(bool LoadingMode)
     m_ErrorMessage.Format(MSG(4));
 
     if (LoadingMode)
-    {
         return m_MMCWriter.LoadTray(0x03);
-    }
 
     return m_MMCWriter.LoadTray(0x02);
 }
@@ -354,28 +373,25 @@ void CCDWriter::GenerateZeroArea(BYTE* Buffer, DWORD lba)
 {
     BYTE* SubQ = Buffer + 2352;
 
-    //   scramble only data
+    // scramble only data
     if ((SubQ[0] & 0xf0) == 0)
     {
         memset(Buffer, 0, 2352);
     }
-
     else
     {
         memset(Buffer, 0, 2352);
 
         if (lba > 0x80000000)
-        {
             lba += 450000;
-        }
 
-        //      m_EDC.Mode1Raw((LPSTR)Buffer,(BYTE)(lba / (75 * 60)),(BYTE)((lba / 75) % 60),(BYTE)(lba % 75));
         if (m_DataMode == 1)
         {
-            m_EDC.Mode1Raw(Buffer, static_cast<BYTE>(lba / (75 * 60)), static_cast<BYTE>((lba / 75) % 60),
-                           static_cast<BYTE>(lba % 75));
+            m_EDC.Mode1Raw(Buffer,
+                static_cast<BYTE>(lba / (75 * 60)),
+                static_cast<BYTE>((lba / 75) % 60),
+                static_cast<BYTE>(lba % 75));
         }
-
         else
         {
             memset(Buffer + 1, 0xff, 10);
@@ -395,27 +411,24 @@ void CCDWriter::GenerateZeroAreaLeadIn(BYTE* Buffer, DWORD lba)
 {
     BYTE* SubQ = Buffer + 2352;
 
-    //   scramble only data
     if (!m_LeadInMode)
     {
         memset(Buffer, 0, 2352);
     }
-
     else
     {
         memset(Buffer, 0, 2352);
 
         if (lba > 0x80000000)
-        {
             lba += 450000;
-        }
 
         if (m_DataMode == 1)
         {
-            m_EDC.Mode1Raw(Buffer, static_cast<BYTE>(lba / (75 * 60)), static_cast<BYTE>((lba / 75) % 60),
-                           static_cast<BYTE>(lba % 75));
+            m_EDC.Mode1Raw(Buffer,
+                static_cast<BYTE>(lba / (75 * 60)),
+                static_cast<BYTE>((lba / 75) % 60),
+                static_cast<BYTE>(lba % 75));
         }
-
         else
         {
             memset(Buffer + 1, 0xff, 10);
@@ -436,28 +449,18 @@ void CCDWriter::Scramble(BYTE* Buffer)
     DWORD i;
     BYTE* SubQ = Buffer + 2352;
 
-    //   scramble only data
     if ((SubQ[0] & 0xf0) == 0)
-    {
         return;
-    }
 
-    //   scrambling
     for (i = 0; i < 2340; i++)
-    {
         Buffer[i + 12] = Buffer[i + 12] ^ m_ScrambleTable[i];
-    }
 }
 
 void CCDWriter::ForceScramble(BYTE* Buffer)
 {
     DWORD i;
-
-    //   scrambling
     for (i = 0; i < 2340; i++)
-    {
         Buffer[i + 12] = Buffer[i + 12] ^ m_ScrambleTable[i];
-    }
 }
 
 bool CCDWriter::IsCDR(void)
@@ -492,14 +495,12 @@ void CCDWriter::GetErrorParams(BYTE& SK, BYTE& ASC, BYTE& ASCQ)
 
 bool CCDWriter::CheckDisc(void)
 {
-    //   test unit ready
     if (m_MMCWriter.TestUnitReady() != 0)
     {
         m_ErrorMessage.Format(MSG(5));
         return false;
     }
 
-    //   check media info
     if (!m_MMCWriter.CheckDisc())
     {
         m_ErrorMessage.Format(MSG(6));
