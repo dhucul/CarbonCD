@@ -1,4 +1,6 @@
 #pragma once
+#include <memory>              // ADD
+
 #include "Aspi.h"
 #include "MMCReader.h"
 #include "MMCSubcodeReader.h"
@@ -10,10 +12,17 @@ public:
     CCDController(void);
     virtual ~CCDController(void);
 
+    // ADD: prevent double-free via accidental copying
+    CCDController(const CCDController&) = delete;
+    CCDController& operator=(const CCDController&) = delete;
+
+    // Optional: allow moving
+    CCDController(CCDController&&) noexcept = default;
+    CCDController& operator=(CCDController&&) noexcept = default;
+
 protected:
-    CAspi* m_Aspi;
-    //  CAspiDriver m_AspiDriver;
-    //  CSptiDriver m_SptiDriver;
+    std::unique_ptr<CAspi> m_Aspi;   // CHANGE from CAspi*
+
 public:
     CAspi* GetAspiCtrl(void);
 

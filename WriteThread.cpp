@@ -1,17 +1,20 @@
-// writethread.cpp  (updated – safety/robustness fixes in one file)
+// writethread.cpp  (updated – UI-thread safe + safety/robustness fixes)
 //
-// Notes (what changed):
+// What changed (UI safety):
+// - Worker thread NEVER touches any dialog controls or dialog CString members.
+// - Worker thread NEVER calls MessageBox directly.
+// - Worker thread NEVER calls CLogWindow UI methods directly.
+// - Worker thread POSTS updates to the dialog (UI thread applies them).
+// - Worker thread SENDS Yes/No queries to the dialog (UI thread shows prompt).
+//
+// What remains from your patch:
 // - Correct CreateThread failure check (NULL, not INVALID_HANDLE_VALUE)
-// - StopThread no longer calls TerminateThread (cooperative stop only)
-// - Fixed CreateFile failure checks (INVALID_HANDLE_VALUE, not NULL/!handle)
-// - Fixed CloseHandle on INVALID_HANDLE_VALUE (notably hPre)
-// - Added ReadFile/GetFileSize error checks in the most dangerous spots
-// - Minor cleanup for consistent handle usage
-//
-// This file assumes your existing writethread.h / class members stay the same.
+// - StopThread cooperative stop (no TerminateThread)
+// - CreateFile / CloseHandle safety
+// - ReadFile/GetFileSize error checks in key spots
 
 #include "writethread.h"
-#include "WriteProgressDialog.h"
+#include "WriteProgressDialog.h"   // brings WM_APP_WRITE_UI_UPDATE / WM_APP_WRITE_QUERY_YESNO
 #include "Setting.h"
 #include "IsoCreator.h"
 #include "CheckSector.h"
@@ -47,6 +50,115 @@ static inline bool GetFileSize32(HANDLE h, DWORD& outSize)
             return false;
     }
     return true;
+}
+
+// ---- UI marshaling helpers (worker -> dialog UI thread) ---------------------
+
+struct WriteUiUpdate
+{
+    bool hasMessage = false;
+    CString message;
+
+    bool hasPercent = false;
+    CString percent;
+
+    bool hasRawFlag = false;
+    CString rawFlag;
+
+    bool hasProgress = false;
+    int progress = 0;
+
+    bool hasLog = false;
+    int logLevel = 0;
+    CString logText;
+
+    bool requestClose = false;
+    bool requestAutoSave = false;
+};
+
+struct WriteUiQueryYesNo
+{
+    CString text;
+    CString caption;
+    UINT flags = MB_YESNO;
+};
+
+static inline HWND SafeHwnd(CWnd* w)
+{
+    return (w && ::IsWindow(w->GetSafeHwnd())) ? w->GetSafeHwnd() : nullptr;
+}
+
+static void PostUi(CWriteThread* t, WriteUiUpdate* up)
+{
+    HWND h = SafeHwnd(t ? t->m_ParentWnd : nullptr);
+    if (!h) { delete up; return; }
+    ::PostMessage(h, WM_APP_WRITE_UI_UPDATE, 0, (LPARAM)up);
+}
+
+static void UiMessage(CWriteThread* t, const CString& s)
+{
+    auto* up = new WriteUiUpdate();
+    up->hasMessage = true;
+    up->message = s;
+    PostUi(t, up);
+}
+
+static void UiProgress(CWriteThread* t, int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    auto* up = new WriteUiUpdate();
+    up->hasProgress = true;
+    up->progress = pct;
+    up->hasPercent = true;
+    up->percent.Format(_T("%d%%"), pct);
+    PostUi(t, up);
+}
+
+static void UiRawFlag(CWriteThread* t, const CString& s)
+{
+    auto* up = new WriteUiUpdate();
+    up->hasRawFlag = true;
+    up->rawFlag = s;
+    PostUi(t, up);
+}
+
+static void UiLog(CWriteThread* t, int level, const CString& s)
+{
+    auto* up = new WriteUiUpdate();
+    up->hasLog = true;
+    up->logLevel = level;
+    up->logText = s;
+    PostUi(t, up);
+}
+
+static void UiAutoSave(CWriteThread* t)
+{
+    auto* up = new WriteUiUpdate();
+    up->requestAutoSave = true;
+    PostUi(t, up);
+}
+
+static void UiClose(CWriteThread* t)
+{
+    auto* up = new WriteUiUpdate();
+    up->requestClose = true;
+    PostUi(t, up);
+}
+
+static int UiAskYesNo(CWriteThread* t, const CString& text, const CString& caption, UINT flags)
+{
+    HWND h = SafeHwnd(t ? t->m_ParentWnd : nullptr);
+    if (!h) return IDNO;
+
+    WriteUiQueryYesNo q;
+    q.text = text;
+    q.caption = caption;
+    q.flags = flags;
+
+    // This runs the prompt on the UI thread and returns IDYES/IDNO to worker.
+    return (int)::SendMessage(h, WM_APP_WRITE_QUERY_YESNO, 0, (LPARAM)&q);
 }
 
 // ---- thread proc ------------------------------------------------------------
@@ -98,14 +210,13 @@ void CWriteThread::StopThread(void)
         return;
     }
 
-    // Cooperative cancellation only (TerminateThread removed).
+    // Cooperative cancellation only.
     m_StopFlag = true;
     MemoryBarrier(); // best-effort visibility if m_StopFlag is plain bool
 
     DWORD exitCode = 0;
     if (GetExitCodeThread(m_hThread, &exitCode) && exitCode == STILL_ACTIVE)
     {
-        // Wait until the thread exits on its own.
         WaitForSingleObject(m_hThread, INFINITE);
     }
 
@@ -116,11 +227,8 @@ void CWriteThread::StopThread(void)
 DWORD CWriteThread::ThreadFunction(void)
 {
     DWORD RetValue = 0;
-    auto Dlg = static_cast<CWriteProgressDialog*>(m_ParentWnd);
 
-    Dlg->m_Progress.SetPos(0);
-    Dlg->m_Percent = "0%";
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    UiProgress(this, 0);
 
     if (m_Dir != nullptr && m_List != nullptr)
     {
@@ -128,14 +236,10 @@ DWORD CWriteThread::ThreadFunction(void)
     }
     else
     {
-        const CString ext = m_CueFileName.Right(3).MakeLower();
+        CString ext = m_CueFileName.Right(3);
+        ext.MakeLower();
 
-        if (ext == "cue")
-        {
-            m_ModeMS = false;
-            RetValue = WriteImage();
-        }
-        else if (ext == "iso")
+        if (ext == _T("cue") || ext == _T("iso"))
         {
             m_ModeMS = false;
             RetValue = WriteImage();
@@ -151,78 +255,74 @@ DWORD CWriteThread::ThreadFunction(void)
 
     if (!m_StopFlag)
     {
-        Dlg->m_Progress.SetPos(100);
+        UiProgress(this, 100);
 
         if (RetValue)
         {
-            Dlg->m_Message = MSG(23);
-            m_LogWnd->AddMessage(LOG_NORMAL, MSG(23));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(23));
+            UiLog(this, LOG_NORMAL, MSG(23));
             m_Success = true;
         }
         else
         {
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(18));
+            UiLog(this, LOG_ERROR, MSG(18));
         }
-
-        Dlg->m_Percent = "100%";
     }
 
-    m_LogWnd->AutoSave();
-    Dlg->PostMessage(WM_COMMAND, ID_WINDOW_CLOSE, 0);
+    UiAutoSave(this);
+    UiClose(this);
     return RetValue;
 }
 
 DWORD CWriteThread::WriteImage(void)
 {
-    auto Dlg = static_cast<CWriteProgressDialog*>(m_ParentWnd);
     CString cs;
-    DWORD RetVal;
+    DWORD RetVal = 0;
 
-    m_LogWnd->AddMessage(LOG_NORMAL, MSG(24));
-    Dlg->m_Message = MSG(24);
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    UiLog(this, LOG_NORMAL, MSG(24));
+    UiMessage(this, MSG(24));
 
     if (m_ModeMS)
     {
-        cs.Format("%s : Multi-Session", MSG(137));
-        m_LogWnd->AddMessage(LOG_NORMAL, cs);
+        cs.Format(_T("%s : Multi-Session"), MSG(137));
+        UiLog(this, LOG_NORMAL, cs);
     }
     else
     {
-        cs.Format("%s : Single-Session", MSG(137));
-        m_LogWnd->AddMessage(LOG_NORMAL, cs);
+        cs.Format(_T("%s : Single-Session"), MSG(137));
+        UiLog(this, LOG_NORMAL, cs);
     }
 
     if (theSetting.m_Write_BurnProof)
-        m_LogWnd->AddMessage(LOG_NORMAL, MSG(25));
+        UiLog(this, LOG_NORMAL, MSG(25));
     if (theSetting.m_Write_TestMode)
-        m_LogWnd->AddMessage(LOG_NORMAL, MSG(26));
+        UiLog(this, LOG_NORMAL, MSG(26));
 
     // parse cue sheet
-    cs.Format(MSG(27), m_CueFileName);
-    Dlg->m_Message = cs;
-    m_LogWnd->AddMessage(LOG_INFO, cs);
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    cs.Format(MSG(27), m_CueFileName.GetString());
+    UiMessage(this, cs);
+    UiLog(this, LOG_INFO, cs);
 
     if (m_ModeMS)
     {
         if (!m_SubMS.ParseFile(m_CueFileName))
         {
-            Dlg->m_Message = m_SubMS.GetErrorMessage();
-            m_LogWnd->AddMessage(LOG_ERROR, m_SubMS.GetErrorMessage());
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, m_SubMS.GetErrorMessage());
+            UiLog(this, LOG_ERROR, m_SubMS.GetErrorMessage());
             return 0;
         }
 
         CString tmp;
-        tmp.Format("%s/%s", m_SubMS.m_ImgFileName, m_SubMS.m_SubFileName);
-        cs.Format(MSG(28), tmp);
-        m_LogWnd->AddMessage(LOG_INFO, cs);
+        tmp.Format(_T("%s/%s"), m_SubMS.m_ImgFileName.GetString(), m_SubMS.m_SubFileName.GetString());
+        cs.Format(MSG(28), tmp.GetString());
+        UiLog(this, LOG_INFO, cs);
     }
     else
     {
-        if (m_CueFileName.Right(3).MakeLower() == "iso")
+        CString ext = m_CueFileName.Right(3);
+        ext.MakeLower();
+
+        if (ext == _T("iso"))
         {
             DWORD FileSize = 0;
             DWORD ReadSize = 0;
@@ -251,17 +351,16 @@ DWORD CWriteThread::WriteImage(void)
             CloseHandle(hFile);
 
             if (memcmp(Header1, ReadBuffer, 16) == 0)
-                cueSheet = "  TRACK 1 MODE1/2352\n   INDEX 1 00:00:00\n";
+                cueSheet = _T("  TRACK 1 MODE1/2352\n   INDEX 1 00:00:00\n");
             else if (memcmp(Header2, ReadBuffer, 16) == 0)
-                cueSheet = "  TRACK 1 MODE2/2352\n   INDEX 1 00:00:00\n";
+                cueSheet = _T("  TRACK 1 MODE2/2352\n   INDEX 1 00:00:00\n");
             else
-                cueSheet = "  TRACK 1 MODE1/2048\n   INDEX 1 00:00:00\n";
+                cueSheet = _T("  TRACK 1 MODE1/2048\n   INDEX 1 00:00:00\n");
 
             if (!m_CD->ParseCueSheet(cueSheet, FileSize))
             {
-                Dlg->m_Message = m_CD->GetWriteError();
-                m_LogWnd->AddMessage(LOG_ERROR, m_CD->GetWriteError());
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, m_CD->GetWriteError());
+                UiLog(this, LOG_ERROR, m_CD->GetWriteError());
                 return 0;
             }
         }
@@ -269,15 +368,14 @@ DWORD CWriteThread::WriteImage(void)
         {
             if (!m_CD->ParseCueSheetFile(m_CueFileName))
             {
-                Dlg->m_Message = m_CD->GetWriteError();
-                m_LogWnd->AddMessage(LOG_ERROR, m_CD->GetWriteError());
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, m_CD->GetWriteError());
+                UiLog(this, LOG_ERROR, m_CD->GetWriteError());
                 return 0;
             }
         }
 
         cs.Format(MSG(28), m_CD->GetImageFileName());
-        m_LogWnd->AddMessage(LOG_INFO, cs);
+        UiLog(this, LOG_INFO, cs);
     }
 
     if (m_StopFlag)
@@ -289,36 +387,36 @@ DWORD CWriteThread::WriteImage(void)
         if (!m_CD->IsCDR())
         {
             cs.Format(MSG(29), m_CD->GetWriteError());
-            Dlg->m_Message = cs;
-            m_LogWnd->AddMessage(LOG_ERROR, cs);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, cs);
+            UiLog(this, LOG_ERROR, cs);
             return 0;
         }
     }
 
     while (!m_CD->CheckDisc())
     {
-        if (MessageBox(nullptr, MSG(30), CONF_MSG, MB_YESNO) == IDNO)
+        if (UiAskYesNo(this, MSG(30), CONF_MSG, MB_YESNO) == IDNO)
         {
-            Dlg->m_Message = MSG(31);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(31));
+            UiMessage(this, MSG(31));
+            UiLog(this, LOG_ERROR, MSG(31));
             return 0;
         }
+
+        if (m_StopFlag)
+            return 0;
     }
 
     // set params
     {
         const bool BurnProof = (theSetting.m_Write_BurnProof != 0);
         const bool TestMode = (theSetting.m_Write_TestMode != 0);
-        const int WriteMode = DetectCommand();
+        const int  WriteMode = DetectCommand();
 
         if (WriteMode < 0)
         {
             cs.Format(MSG(32), m_CD->GetWriteError());
-            Dlg->m_Message = cs;
-            m_LogWnd->AddMessage(LOG_ERROR, cs);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, cs);
+            UiLog(this, LOG_ERROR, cs);
             return 0;
         }
 
@@ -326,9 +424,8 @@ DWORD CWriteThread::WriteImage(void)
         {
             if (WriteMode != WRITEMODE_RAW_96 && WriteMode != WRITEMODE_RAW_P96 && WriteMode != WRITEMODE_RAW_16)
             {
-                Dlg->m_Message = MSG(138);
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(138));
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, MSG(138));
+                UiLog(this, LOG_ERROR, MSG(138));
                 return 0;
             }
         }
@@ -336,15 +433,14 @@ DWORD CWriteThread::WriteImage(void)
         if (!m_CD->SetWritingParams(WriteMode, BurnProof, TestMode, theSetting.m_Write_Buffer))
         {
             cs.Format(MSG(33), m_CD->GetWriteError());
-            Dlg->m_Message = cs;
-            m_LogWnd->AddMessage(LOG_ERROR, cs);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, cs);
+            UiLog(this, LOG_ERROR, cs);
             return 0;
         }
     }
 
     cs.Format(MSG(34), m_CD->GetBufferSize());
-    m_LogWnd->AddMessage(LOG_INFO, cs);
+    UiLog(this, LOG_INFO, cs);
 
     // set writing speed
     m_CD->SetSpeed(0xff, theSetting.m_Write_Speed);
@@ -352,15 +448,13 @@ DWORD CWriteThread::WriteImage(void)
     // OPC
     if (theSetting.m_Write_Opc)
     {
-        Dlg->m_Message = MSG(35);
-        m_LogWnd->AddMessage(LOG_INFO, MSG(35));
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(35));
+        UiLog(this, LOG_INFO, MSG(35));
 
         if (!m_CD->OPC())
         {
-            Dlg->m_Message = MSG(36);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(36));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(36));
+            UiLog(this, LOG_ERROR, MSG(36));
             return 0;
         }
     }
@@ -369,9 +463,8 @@ DWORD CWriteThread::WriteImage(void)
     if (!m_CD->StartWriting(m_ModeMS))
     {
         cs.Format(MSG(33), m_CD->GetWriteError());
-        Dlg->m_Message = cs;
-        m_LogWnd->AddMessage(LOG_ERROR, cs);
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, cs);
+        UiLog(this, LOG_ERROR, cs);
         return 0;
     }
 
@@ -388,15 +481,14 @@ DWORD CWriteThread::WriteImage(void)
     {
         BYTE sk, asc, ascq;
         m_CD->GetWriteErrorParams(sk, asc, ascq);
-        cs.Format("Error Status SK:%02X ASC:%02X ASCQ:%02X", sk, asc, ascq);
-        m_LogWnd->AddMessage(LOG_INFO, cs);
+        cs.Format(_T("Error Status SK:%02X ASC:%02X ASCQ:%02X"), sk, asc, ascq);
+        UiLog(this, LOG_INFO, cs);
     }
 
     // flush/abort
     if (!m_StopFlag && RetVal)
     {
-        Dlg->m_Message = MSG(37);
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(37));
         m_CD->FinishWriting();
     }
     else
@@ -407,10 +499,7 @@ DWORD CWriteThread::WriteImage(void)
     if (theSetting.m_Write_EjectTray)
     {
         if (RetVal)
-        {
-            Dlg->m_Message = MSG(38);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
-        }
+            UiMessage(this, MSG(38));
 
         m_CD->LoadTray(false);
     }
@@ -422,7 +511,6 @@ DWORD CWriteThread::WriteImage(void)
 
 DWORD CWriteThread::WriteImageSubMS(void)
 {
-    auto Dlg = static_cast<CWriteProgressDialog*>(m_ParentWnd);
     CString cs;
 
     int session;
@@ -434,7 +522,6 @@ DWORD CWriteThread::WriteImageSubMS(void)
     HANDLE hSub = INVALID_HANDLE_VALUE;
     HANDLE hPre = INVALID_HANDLE_VALUE;
 
-    DWORD read = 0;
     DWORD ret = 1;
     DWORD FrameCount = 0;
     DWORD MaxFrames = 0;
@@ -446,9 +533,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
     hImg = CreateFile(m_SubMS.m_ImgFileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hImg == INVALID_HANDLE_VALUE)
     {
-        Dlg->m_Message = MSG(43);
-        m_LogWnd->AddMessage(LOG_ERROR, MSG(43));
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(43));
+        UiLog(this, LOG_ERROR, MSG(43));
         return 0;
     }
 
@@ -457,9 +543,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
         if (!GetFileSize32(hImg, fileSize))
         {
             CloseHandle(hImg);
-            Dlg->m_Message = MSG(43);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(43));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(43));
+            UiLog(this, LOG_ERROR, MSG(43));
             return 0;
         }
         size = fileSize / 2352;
@@ -468,9 +553,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
     hSub = CreateFile(m_SubMS.m_SubFileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hSub == INVALID_HANDLE_VALUE)
     {
-        Dlg->m_Message = MSG(43);
-        m_LogWnd->AddMessage(LOG_ERROR, MSG(43));
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(43));
+        UiLog(this, LOG_ERROR, MSG(43));
         CloseHandle(hImg);
         return 0;
     }
@@ -480,34 +564,32 @@ DWORD CWriteThread::WriteImageSubMS(void)
         hPre = CreateFile(m_SubMS.m_PreFileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hPre != INVALID_HANDLE_VALUE)
         {
-            cs.Format("PregapFile:%s", m_SubMS.m_PreFileName);
-            m_LogWnd->AddMessage(LOG_INFO, cs);
+            cs.Format(_T("PregapFile:%s"), m_SubMS.m_PreFileName.GetString());
+            UiLog(this, LOG_INFO, cs);
         }
     }
 
     m_SubMS.CalcPositions(0 - m_CD->GetLeadInSize());
 
     cs.Format(MSG(143), m_SubMS.m_ImageVersion);
-    m_LogWnd->AddMessage(LOG_INFO, cs);
+    UiLog(this, LOG_INFO, cs);
 
     if (m_SubMS.m_CDM_Extension)
     {
         cs.Format(MSG(144), m_SubMS.m_ProductName);
-        m_LogWnd->AddMessage(LOG_INFO, cs);
+        UiLog(this, LOG_INFO, cs);
         cs.Format(MSG(145), m_SubMS.m_VendorName);
-        m_LogWnd->AddMessage(LOG_INFO, cs);
+        UiLog(this, LOG_INFO, cs);
         cs.Format(MSG(146), m_SubMS.m_Revision);
-        m_LogWnd->AddMessage(LOG_INFO, cs);
+        UiLog(this, LOG_INFO, cs);
     }
 
     for (session = 0; session < m_SubMS.GetSessionCount(); session++)
     {
         cs.Format(MSG(140), session + 1);
-        m_LogWnd->AddMessage(LOG_INFO, cs);
-        Dlg->m_Message = cs;
-        Dlg->m_Percent = "0%";
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
-        Dlg->m_Progress.SetPos(0);
+        UiLog(this, LOG_INFO, cs);
+        UiMessage(this, cs);
+        UiProgress(this, 0);
 
         FrameCount = 0;
         Percent = 0;
@@ -546,9 +628,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
 
             if (!m_CD->WriteRaw96(Buffer, lba))
             {
-                Dlg->m_Message = MSG(40);
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(40));
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, MSG(40));
+                UiLog(this, LOG_ERROR, MSG(40));
                 ret = 0;
             }
 
@@ -557,9 +638,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
             if (Percent < newPct)
             {
                 Percent = newPct;
-                Dlg->m_Progress.SetPos(Percent);
-                Dlg->m_Percent.Format("%d%%", Percent);
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiProgress(this, (int)Percent);
             }
         }
 
@@ -577,9 +656,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
             {
                 if (!ReadExact(hPre, Buffer, 2352))
                 {
-                    Dlg->m_Message = MSG(41);
-                    m_LogWnd->AddMessage(LOG_ERROR, MSG(41));
-                    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                    UiMessage(this, MSG(41));
+                    UiLog(this, LOG_ERROR, MSG(41));
                     ret = 0;
                     break;
                 }
@@ -606,9 +684,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
 
             if (!m_CD->WriteRaw96(Buffer, lba))
             {
-                Dlg->m_Message = MSG(41);
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(41));
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, MSG(41));
+                UiLog(this, LOG_ERROR, MSG(41));
                 ret = 0;
             }
 
@@ -617,9 +694,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
             if (Percent < newPct)
             {
                 Percent = newPct;
-                Dlg->m_Progress.SetPos(Percent);
-                Dlg->m_Percent.Format("%d%%", Percent);
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiProgress(this, (int)Percent);
             }
         }
 
@@ -627,9 +702,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
         if (ret && !m_StopFlag)
         {
             cs.Format(MSG(141), session + 1);
-            m_LogWnd->AddMessage(LOG_INFO, cs);
-            Dlg->m_Message = cs;
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiLog(this, LOG_INFO, cs);
+            UiMessage(this, cs);
         }
 
         for (;; lba++)
@@ -651,9 +725,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
 
             if (!ReadExact(hSub, SubBuffer, 96) || !ReadExact(hImg, Buffer, 2352))
             {
-                Dlg->m_Message = MSG(44);
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, MSG(44));
+                UiLog(this, LOG_ERROR, MSG(44));
                 ret = 0;
                 break;
             }
@@ -684,9 +757,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
 
             if (!m_CD->WriteRaw96(Buffer, lba))
             {
-                Dlg->m_Message = MSG(44);
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, MSG(44));
+                UiLog(this, LOG_ERROR, MSG(44));
                 ret = 0;
             }
 
@@ -695,9 +767,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
             if (Percent < newPct)
             {
                 Percent = newPct;
-                Dlg->m_Progress.SetPos(Percent);
-                Dlg->m_Percent.Format("%d%%", Percent);
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiProgress(this, (int)Percent);
             }
         }
 
@@ -705,9 +775,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
         if (ret && !m_StopFlag)
         {
             cs.Format(MSG(142), session + 1);
-            m_LogWnd->AddMessage(LOG_INFO, cs);
-            Dlg->m_Message = cs;
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiLog(this, LOG_INFO, cs);
+            UiMessage(this, cs);
         }
 
         m_SubMS.ResetGenerator(m_SubMS.m_LeadOutLBA[session], SUBTYPE_LEADOUT, session);
@@ -744,9 +813,8 @@ DWORD CWriteThread::WriteImageSubMS(void)
 
             if (!m_CD->WriteRaw96(Buffer, lba))
             {
-                Dlg->m_Message = MSG(46);
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(46));
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, MSG(46));
+                UiLog(this, LOG_ERROR, MSG(46));
                 ret = 0;
             }
 
@@ -755,9 +823,7 @@ DWORD CWriteThread::WriteImageSubMS(void)
             if (Percent < newPct)
             {
                 Percent = newPct;
-                Dlg->m_Progress.SetPos(Percent);
-                Dlg->m_Percent.Format("%d%%", Percent);
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiProgress(this, (int)Percent);
             }
         }
 
@@ -775,34 +841,30 @@ DWORD CWriteThread::WriteImageSubMS(void)
     return ret;
 }
 
-// (unchanged except: ReadFile return/bytes checks + CreateFile checks)
+// Single-session writing (UI-thread safe progress/log updates)
 DWORD CWriteThread::WriteImageSubSS(void)
 {
-    auto Dlg = static_cast<CWriteProgressDialog*>(m_ParentWnd);
     DWORD TotalFrames, CurrentFrames, Percent;
-    DWORD i, read;
+    DWORD i;
     HANDLE hFile = INVALID_HANDLE_VALUE;
-    CString cs;
     BYTE Buffer[2352];
 
     TotalFrames = m_CD->GetLeadInSize() + 150 + m_CD->GetImageFrames() + 90 * 75;
     CurrentFrames = 0;
     Percent = 0;
 
-    // lead-in
-    Dlg->m_Message = MSG(39);
-    m_LogWnd->AddMessage(LOG_INFO, MSG(39));
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    UiMessage(this, MSG(39));
+    UiLog(this, LOG_INFO, MSG(39));
 
+    // lead-in
     for (i = 0; i < m_CD->GetLeadInSize(); i++)
     {
         if (m_StopFlag) return 0;
 
         if (!m_CD->WriteRawLeadIn())
         {
-            Dlg->m_Message = MSG(40);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(40));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(40));
+            UiLog(this, LOG_ERROR, MSG(40));
             return 0;
         }
 
@@ -811,9 +873,7 @@ DWORD CWriteThread::WriteImageSubSS(void)
         if (Percent < newPct)
         {
             Percent = newPct;
-            Dlg->m_Progress.SetPos(Percent);
-            Dlg->m_Percent.Format("%d%%", Percent);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiProgress(this, (int)Percent);
         }
     }
 
@@ -824,9 +884,8 @@ DWORD CWriteThread::WriteImageSubSS(void)
 
         if (!m_CD->WriteRawGap())
         {
-            Dlg->m_Message = MSG(41);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(41));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(41));
+            UiLog(this, LOG_ERROR, MSG(41));
             return 0;
         }
 
@@ -835,16 +894,13 @@ DWORD CWriteThread::WriteImageSubSS(void)
         if (Percent < newPct)
         {
             Percent = newPct;
-            Dlg->m_Progress.SetPos(Percent);
-            Dlg->m_Percent.Format("%d%%", Percent);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiProgress(this, (int)Percent);
         }
     }
 
     // main data
-    Dlg->m_Message = MSG(42);
-    m_LogWnd->AddMessage(LOG_INFO, MSG(42));
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    UiMessage(this, MSG(42));
+    UiLog(this, LOG_INFO, MSG(42));
 
     if (m_CD->GetImageFileName() == nullptr || *(m_CD->GetImageFileName()) == '\0')
         hFile = CreateFile(m_CueFileName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -853,9 +909,8 @@ DWORD CWriteThread::WriteImageSubSS(void)
 
     if (hFile == INVALID_HANDLE_VALUE)
     {
-        Dlg->m_Message = MSG(43);
-        m_LogWnd->AddMessage(LOG_ERROR, MSG(43));
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(43));
+        UiLog(this, LOG_ERROR, MSG(43));
         return 0;
     }
 
@@ -864,9 +919,8 @@ DWORD CWriteThread::WriteImageSubSS(void)
         if (!ReadExact(hFile, Buffer, 2352))
         {
             CloseHandle(hFile);
-            Dlg->m_Message = MSG(44);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(44));
+            UiLog(this, LOG_ERROR, MSG(44));
             return 0;
         }
 
@@ -879,9 +933,8 @@ DWORD CWriteThread::WriteImageSubSS(void)
         if (!m_CD->WriteRaw(Buffer))
         {
             CloseHandle(hFile);
-            Dlg->m_Message = MSG(44);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(44));
+            UiLog(this, LOG_ERROR, MSG(44));
             return 0;
         }
 
@@ -890,20 +943,17 @@ DWORD CWriteThread::WriteImageSubSS(void)
         if (Percent < newPct)
         {
             Percent = newPct;
-            Dlg->m_Progress.SetPos(Percent);
-            Dlg->m_Percent.Format("%d%%", Percent);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiProgress(this, (int)Percent);
         }
     }
 
     CloseHandle(hFile);
 
+    // lead-out
     if (m_CD->GetWritingMode() != WRITEMODE_2048)
     {
-        // lead-out
-        Dlg->m_Message = MSG(45);
-        m_LogWnd->AddMessage(LOG_INFO, MSG(45));
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(45));
+        UiLog(this, LOG_INFO, MSG(45));
 
         for (i = 0; i < 90 * 75; i++)
         {
@@ -911,9 +961,8 @@ DWORD CWriteThread::WriteImageSubSS(void)
 
             if (!m_CD->WriteRawGap())
             {
-                Dlg->m_Message = MSG(46);
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(46));
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, MSG(46));
+                UiLog(this, LOG_ERROR, MSG(46));
                 return 0;
             }
 
@@ -922,9 +971,7 @@ DWORD CWriteThread::WriteImageSubSS(void)
             if (Percent < newPct)
             {
                 Percent = newPct;
-                Dlg->m_Progress.SetPos(Percent);
-                Dlg->m_Percent.Format("%d%%", Percent);
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiProgress(this, (int)Percent);
             }
         }
     }
@@ -936,160 +983,131 @@ DWORD CWriteThread::WriteImageSubSS(void)
     return 1;
 }
 
-// Everything below this point is your original code (unchanged)
-// ---------------------------------------------------------------------------
-// Mastering(), MasteringSub(), CreateCueSheet(), SkipAudioHeader(), DetectCommand()
-// If you want, I can apply the same ReadFile/CreateFile/CloseHandle fixes throughout
-// those functions too, but I kept the patch focused to avoid breaking behavior.
+// Everything below: keep behavior; just marshal logs/rawflag and remove dialog touches
 
 DWORD CWriteThread::Mastering(void)
 {
-    auto Dlg = static_cast<CWriteProgressDialog*>(m_ParentWnd);
     CString cs, CueSheet;
-    DWORD RetVal;
-    Dlg->m_Message = MSG(47);
-    m_LogWnd->AddMessage(LOG_NORMAL, MSG(47));
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
-    cs.Format("%s : Mastering", MSG(137));
-    m_LogWnd->AddMessage(LOG_NORMAL, cs);
-    //   create cue-sheet
-    Dlg->m_Message = MSG(48);
-    m_LogWnd->AddMessage(LOG_NORMAL, MSG(48));
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    DWORD RetVal = 0;
+
+    UiMessage(this, MSG(47));
+    UiLog(this, LOG_NORMAL, MSG(47));
+
+    cs.Format(_T("%s : Mastering"), MSG(137));
+    UiLog(this, LOG_NORMAL, cs);
+
+    UiMessage(this, MSG(48));
+    UiLog(this, LOG_NORMAL, MSG(48));
 
     if (!CreateCueSheet(CueSheet))
     {
-        Dlg->m_Message = MSG(48);
-        m_LogWnd->AddMessage(LOG_ERROR, MSG(48));
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(48));
+        UiLog(this, LOG_ERROR, MSG(48));
         return 0;
     }
 
-    m_LogWnd->AddMessage(LOG_NORMAL, MSG(24));
-    Dlg->m_Message = MSG(24);
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    UiLog(this, LOG_NORMAL, MSG(24));
+    UiMessage(this, MSG(24));
 
     if (theSetting.m_Write_BurnProof)
-    {
-        m_LogWnd->AddMessage(LOG_NORMAL, MSG(25));
-    }
+        UiLog(this, LOG_NORMAL, MSG(25));
 
     if (theSetting.m_Write_TestMode)
-    {
-        m_LogWnd->AddMessage(LOG_NORMAL, MSG(26));
-    }
+        UiLog(this, LOG_NORMAL, MSG(26));
 
-    //   parse cue sheet
-    Dlg->m_Message = MSG(50);
-    m_LogWnd->AddMessage(LOG_INFO, MSG(50));
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    UiMessage(this, MSG(50));
+    UiLog(this, LOG_INFO, MSG(50));
 
     if (!m_CD->ParseCueSheet(CueSheet, m_TotalFrames * 2352))
     {
-        Dlg->m_Message = m_CD->GetWriteError();
-        m_LogWnd->AddMessage(LOG_ERROR, m_CD->GetWriteError());
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, m_CD->GetWriteError());
+        UiLog(this, LOG_ERROR, m_CD->GetWriteError());
         return 0;
     }
 
     if (m_StopFlag)
-    {
         return 0;
-    }
 
-    //   check drive
+    // check drive
     if (theSetting.m_Write_CheckDrive)
     {
         if (!m_CD->IsCDR())
         {
-            Dlg->m_Message = MSG(29);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(29));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(29));
+            UiLog(this, LOG_ERROR, MSG(29));
             return 0;
         }
     }
 
     while (!m_CD->CheckDisc())
     {
-        if (MessageBox(nullptr, MSG(30), CONF_MSG, MB_YESNO) == IDNO)
+        if (UiAskYesNo(this, MSG(30), CONF_MSG, MB_YESNO) == IDNO)
         {
-            Dlg->m_Message = MSG(31);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(31));
+            UiMessage(this, MSG(31));
+            UiLog(this, LOG_ERROR, MSG(31));
             return 0;
         }
+
+        if (m_StopFlag)
+            return 0;
     }
 
-    //   set params
+    // set params
     {
-        bool BurnProof;
-        bool TestMode;
-        int WriteMode;
-        BurnProof = (theSetting.m_Write_BurnProof) ? true : false;
-        TestMode = theSetting.m_Write_TestMode ? true : false;
-        WriteMode = DetectCommand();
+        bool BurnProof = (theSetting.m_Write_BurnProof != 0);
+        bool TestMode = (theSetting.m_Write_TestMode != 0);
+        int  WriteMode = DetectCommand();
 
         if (WriteMode < 0)
         {
-            Dlg->m_Message = MSG(32);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(32));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(32));
+            UiLog(this, LOG_ERROR, MSG(32));
             return 0;
         }
 
         if (!m_CD->SetWritingParams(WriteMode, BurnProof, TestMode, theSetting.m_Write_Buffer))
         {
             cs.Format(MSG(33), m_CD->GetWriteError());
-            Dlg->m_Message = cs;
-            m_LogWnd->AddMessage(LOG_ERROR, cs);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, cs);
+            UiLog(this, LOG_ERROR, cs);
             return 0;
         }
     }
+
     cs.Format(MSG(34), m_CD->GetBufferSize());
-    m_LogWnd->AddMessage(LOG_INFO, cs);
-    //   set writing speed
+    UiLog(this, LOG_INFO, cs);
+
     m_CD->SetSpeed(0xff, theSetting.m_Write_Speed);
 
-    //  Performing Optimize Power Calibration
     if (theSetting.m_Write_Opc)
     {
-        Dlg->m_Message = MSG(35);
-        m_LogWnd->AddMessage(LOG_INFO, MSG(35));
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(35));
+        UiLog(this, LOG_INFO, MSG(35));
 
         if (!m_CD->OPC())
         {
-            Dlg->m_Message = MSG(36);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(36));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(36));
+            UiLog(this, LOG_ERROR, MSG(36));
             return 0;
         }
     }
 
-    //  start writing
     if (!m_CD->StartWriting(false))
     {
         cs.Format(MSG(33), m_CD->GetWriteError());
-        Dlg->m_Message = cs;
-        m_LogWnd->AddMessage(LOG_ERROR, cs);
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, cs);
+        UiLog(this, LOG_ERROR, cs);
         return 0;
     }
 
     if (m_StopFlag)
-    {
         return 0;
-    }
 
-    //   Writing
     RetVal = MasteringSub();
 
-    //   flush buffer
     if (!m_StopFlag && RetVal)
     {
-        Dlg->m_Message = MSG(37);
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(37));
         m_CD->FinishWriting();
     }
     else
@@ -1099,8 +1117,7 @@ DWORD CWriteThread::Mastering(void)
 
     if (theSetting.m_Write_EjectTray)
     {
-        Dlg->m_Message = MSG(38);
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(38));
         m_CD->LoadTray(false);
     }
 
@@ -1108,19 +1125,15 @@ DWORD CWriteThread::Mastering(void)
     {
         BYTE sk, asc, ascq;
         m_CD->GetWriteErrorParams(sk, asc, ascq);
-        cs.Format("Error Status SK:%02X ASC:%02X ASCQ:%02X", sk, asc, ascq);
-        m_LogWnd->AddMessage(LOG_INFO, cs);
+        cs.Format(_T("Error Status SK:%02X ASC:%02X ASCQ:%02X"), sk, asc, ascq);
+        UiLog(this, LOG_INFO, cs);
     }
 
     return RetVal;
 }
 
-
-
-
 DWORD CWriteThread::MasteringSub(void)
 {
-    auto Dlg = static_cast<CWriteProgressDialog*>(m_ParentWnd);
     DWORD TotalFrames, CurrentFrames, Percent;
     DWORD i;
     CIsoCreator iso;
@@ -1132,7 +1145,6 @@ DWORD CWriteThread::MasteringSub(void)
     CCheckSector edc;
     MSFAddress msf;
 
-    //   initialize
     if (m_List->GetItemData(0) == 0)
     {
         iso.SetParams(m_VolumeLabel, theSetting.m_CopyProtectionSize);
@@ -1140,216 +1152,166 @@ DWORD CWriteThread::MasteringSub(void)
         iso.InitializeReading();
     }
 
-    //            Lead-In                    Pre-Gap   Main Data       Lead-Out
     TotalFrames = m_CD->GetLeadInSize() + 150 + m_TotalFrames + 90 * 75;
     CurrentFrames = 0;
     Percent = 0;
-    //   write lead-in
-    Dlg->m_Message = MSG(39);
-    m_LogWnd->AddMessage(LOG_INFO, MSG(39));
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+
+    UiMessage(this, MSG(39));
+    UiLog(this, LOG_INFO, MSG(39));
 
     for (i = 0; i < m_CD->GetLeadInSize(); i++)
     {
-        if (m_StopFlag)
-        {
-            return 0;
-        }
+        if (m_StopFlag) return 0;
 
         if (!m_CD->WriteRawLeadIn())
         {
-            Dlg->m_Message = MSG(40);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(40));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(40));
+            UiLog(this, LOG_ERROR, MSG(40));
             return 0;
         }
 
         CurrentFrames++;
-
-        if (Percent < ((CurrentFrames * 100) / TotalFrames))
+        const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+        if (Percent < newPct)
         {
-            Percent = ((CurrentFrames * 100) / TotalFrames);
-            Dlg->m_Progress.SetPos(Percent);
-            Dlg->m_Percent.Format("%d%%", Percent);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            Percent = newPct;
+            UiProgress(this, (int)Percent);
         }
     }
 
-    //   write pregap
     for (i = 0; i < 150; i++)
     {
-        if (m_StopFlag)
-        {
-            return 0;
-        }
+        if (m_StopFlag) return 0;
 
         if (!m_CD->WriteRawGap())
         {
-            Dlg->m_Message = MSG(41);
-            m_LogWnd->AddMessage(LOG_ERROR, MSG(41));
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            UiMessage(this, MSG(41));
+            UiLog(this, LOG_ERROR, MSG(41));
             return 0;
         }
 
         CurrentFrames++;
-
-        if (Percent < ((CurrentFrames * 100) / TotalFrames))
+        const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+        if (Percent < newPct)
         {
-            Percent = ((CurrentFrames * 100) / TotalFrames);
-            Dlg->m_Progress.SetPos(Percent);
-            Dlg->m_Percent.Format("%d%%", Percent);
-            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+            Percent = newPct;
+            UiProgress(this, (int)Percent);
         }
     }
 
-    //   write main data
-    Dlg->m_Message = MSG(42);
-    m_LogWnd->AddMessage(LOG_INFO, MSG(42));
-    PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+    UiMessage(this, MSG(42));
+    UiLog(this, LOG_INFO, MSG(42));
+
     PrevTrackType = 0;
 
     for (i = 0; i < static_cast<DWORD>(m_List->GetItemCount()); i++)
     {
         TrackType = m_List->GetItemData(i);
 
-        if (m_StopFlag)
-        {
-            break;
-        }
+        if (m_StopFlag) break;
 
-        if (TrackType == 0) //   data track
+        if (TrackType == 0)
         {
-            //   DATA   ---------------------------------------------------
             CString tt;
-            m_LogWnd->AddMessage(LOG_INFO, MSG(51));
+            UiLog(this, LOG_INFO, MSG(51));
             tt = m_List->GetItemText(0, 1);
 
             if (tt == "Mastering")
             {
                 while (iso.GetHeaderFrame(Buffer))
                 {
-                    if (m_StopFlag)
-                    {
-                        break;
-                    }
+                    if (m_StopFlag) break;
 
                     if (!m_CD->WriteRaw(Buffer))
                     {
-                        Dlg->m_Message = MSG(44);
-                        m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        UiMessage(this, MSG(44));
+                        UiLog(this, LOG_ERROR, MSG(44));
                         return 0;
                     }
 
                     CurrentFrames++;
-
-                    if (Percent < ((CurrentFrames * 100) / TotalFrames))
+                    const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+                    if (Percent < newPct)
                     {
-                        Percent = ((CurrentFrames * 100) / TotalFrames);
-                        Dlg->m_Progress.SetPos(Percent);
-                        Dlg->m_Percent.Format("%d%%", Percent);
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        Percent = newPct;
+                        UiProgress(this, (int)Percent);
                     }
                 }
 
 #if COPY_PROTECTION
-
                 while (iso.GetProtectionArea(Buffer))
                 {
-                    if (m_StopFlag)
-                    {
-                        break;
-                    }
+                    if (m_StopFlag) break;
 
                     if (!m_CD->WriteRaw(Buffer))
                     {
-                        Dlg->m_Message = MSG(44);
-                        m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        UiMessage(this, MSG(44));
+                        UiLog(this, LOG_ERROR, MSG(44));
                         return 0;
                     }
 
                     CurrentFrames++;
-
-                    if (Percent < ((CurrentFrames * 100) / TotalFrames))
+                    const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+                    if (Percent < newPct)
                     {
-                        Percent = ((CurrentFrames * 100) / TotalFrames);
-                        Dlg->m_Progress.SetPos(Percent);
-                        Dlg->m_Percent.Format("%d%%", Percent);
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        Percent = newPct;
+                        UiProgress(this, (int)Percent);
                     }
                 }
-
 #endif
 
                 while (iso.OpenReadFile())
                 {
-                    if (m_StopFlag) { break; }
+                    if (m_StopFlag) break;
 
                     while (iso.GetFrame(Buffer))
                     {
-                        if (m_StopFlag) { break; }
+                        if (m_StopFlag) break;
 
                         if (!m_CD->WriteRaw(Buffer))
                         {
-                            Dlg->m_Message = MSG(44);
-                            m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                            UiMessage(this, MSG(44));
+                            UiLog(this, LOG_ERROR, MSG(44));
                             return 0;
                         }
 
                         CurrentFrames++;
-
-                        if (Percent < ((CurrentFrames * 100) / TotalFrames))
+                        const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+                        if (Percent < newPct)
                         {
-                            Percent = ((CurrentFrames * 100) / TotalFrames);
-                            Dlg->m_Progress.SetPos(Percent);
-                            Dlg->m_Percent.Format("%d%%", Percent);
-                            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                            Percent = newPct;
+                            UiProgress(this, (int)Percent);
                         }
                     }
 
                     iso.CloseReadFile();
                 }
             }
-
             else if (tt == "MODE1/2048")
             {
                 HANDLE hFileRead;
                 CString FileName;
-                DWORD lba;
-                lba = 150;
+                DWORD lba = 150;
                 FileName = m_List->GetItemText(i, 2);
-                hFileRead = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                       FILE_ATTRIBUTE_NORMAL, nullptr);
+                hFileRead = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
                 if (hFileRead == INVALID_HANDLE_VALUE)
-                {
                     return false;
-                }
 
                 while (true)
                 {
-                    if (m_StopFlag)
-                    {
-                        break;
-                    }
+                    if (m_StopFlag) break;
 
                     ReadFile(hFileRead, Buffer + 16, 2048, &read, nullptr);
-
-                    if (read < 2048)
-                    {
-                        break;
-                    }
+                    if (read < 2048) break;
 
                     msf = lba;
                     edc.Mode1Raw(Buffer, msf.Minute, msf.Second, msf.Frame);
 
                     if (!m_CD->WriteRaw(Buffer))
                     {
-                        Dlg->m_Message = MSG(44);
-                        m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        UiMessage(this, MSG(44));
+                        UiLog(this, LOG_ERROR, MSG(44));
                         CloseHandle(hFileRead);
                         return false;
                     }
@@ -1357,77 +1319,62 @@ DWORD CWriteThread::MasteringSub(void)
                     CurrentFrames++;
                     lba++;
 
-                    if (Percent < ((CurrentFrames * 100) / TotalFrames))
+                    const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+                    if (Percent < newPct)
                     {
-                        Percent = ((CurrentFrames * 100) / TotalFrames);
-                        Dlg->m_Progress.SetPos(Percent);
-                        Dlg->m_Percent.Format("%d%%", Percent);
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        Percent = newPct;
+                        UiProgress(this, (int)Percent);
                     }
                 }
-            }
 
+                CloseHandle(hFileRead);
+            }
             else if (tt == "MODE1/2352" || tt == "MODE2/2352")
             {
                 HANDLE hFileRead;
                 CString FileName;
                 FileName = m_List->GetItemText(i, 2);
-                hFileRead = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                       FILE_ATTRIBUTE_NORMAL, nullptr);
+                hFileRead = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
                 if (hFileRead == INVALID_HANDLE_VALUE)
-                {
                     return false;
-                }
 
                 while (true)
                 {
-                    if (m_StopFlag)
-                    {
-                        break;
-                    }
+                    if (m_StopFlag) break;
 
                     ReadFile(hFileRead, Buffer, 2352, &read, nullptr);
-
-                    if (read < 2352)
-                    {
-                        break;
-                    }
+                    if (read < 2352) break;
 
                     if (!m_CD->WriteRaw(Buffer))
                     {
-                        Dlg->m_Message = MSG(44);
-                        m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        UiMessage(this, MSG(44));
+                        UiLog(this, LOG_ERROR, MSG(44));
                         CloseHandle(hFileRead);
                         return false;
                     }
 
                     CurrentFrames++;
 
-                    if (Percent < ((CurrentFrames * 100) / TotalFrames))
+                    const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+                    if (Percent < newPct)
                     {
-                        Percent = ((CurrentFrames * 100) / TotalFrames);
-                        Dlg->m_Progress.SetPos(Percent);
-                        Dlg->m_Percent.Format("%d%%", Percent);
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        Percent = newPct;
+                        UiProgress(this, (int)Percent);
                     }
                 }
+
+                CloseHandle(hFileRead);
             }
 
-            if (m_StopFlag)
-            {
-                break;
-            }
-
+            if (m_StopFlag) break;
             PrevTrackType = TrackType;
         }
-
-        else //   audio track
+        else
         {
-            //   AUDIO   ---------------------------------------------------
             cs.Format(MSG(52), i + 1);
-            m_LogWnd->AddMessage(LOG_INFO, cs);
+            UiLog(this, LOG_INFO, cs);
+
             HANDLE hFileRead;
             CString FileName;
 
@@ -1440,36 +1387,29 @@ DWORD CWriteThread::MasteringSub(void)
                 {
                     if (!m_CD->WriteRaw(Buffer))
                     {
-                        Dlg->m_Message = MSG(44);
-                        m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        UiMessage(this, MSG(44));
+                        UiLog(this, LOG_ERROR, MSG(44));
                         return 0;
                     }
 
                     CurrentFrames++;
-
-                    if (Percent < ((CurrentFrames * 100) / TotalFrames))
+                    const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+                    if (Percent < newPct)
                     {
-                        Percent = ((CurrentFrames * 100) / TotalFrames);
-                        Dlg->m_Progress.SetPos(Percent);
-                        Dlg->m_Percent.Format("%d%%", Percent);
-                        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                        Percent = newPct;
+                        UiProgress(this, (int)Percent);
                     }
                 }
             }
 
             FileName = m_List->GetItemText(i, 2);
-            hFileRead = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+            hFileRead = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
             if (SkipAudioHeader(hFileRead))
             {
                 while (true)
                 {
-                    if (m_StopFlag)
-                    {
-                        break;
-                    }
+                    if (m_StopFlag) break;
 
                     ReadFile(hFileRead, Buffer, 2352, &read, nullptr);
 
@@ -1477,102 +1417,83 @@ DWORD CWriteThread::MasteringSub(void)
                     {
                         if (!m_CD->WriteRaw(Buffer))
                         {
-                            Dlg->m_Message = MSG(44);
-                            m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                            UiMessage(this, MSG(44));
+                            UiLog(this, LOG_ERROR, MSG(44));
+                            CloseHandle(hFileRead);
                             return 0;
                         }
 
                         CurrentFrames++;
-
-                        if (Percent < ((CurrentFrames * 100) / TotalFrames))
+                        const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+                        if (Percent < newPct)
                         {
-                            Percent = ((CurrentFrames * 100) / TotalFrames);
-                            Dlg->m_Progress.SetPos(Percent);
-                            Dlg->m_Percent.Format("%d%%", Percent);
-                            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                            Percent = newPct;
+                            UiProgress(this, (int)Percent);
                         }
                     }
-
                     else if (read > 0)
                     {
                         memset(Buffer + read, 0, 2352 - read);
 
                         if (!m_CD->WriteRaw(Buffer))
                         {
-                            Dlg->m_Message = MSG(44);
-                            m_LogWnd->AddMessage(LOG_ERROR, MSG(44));
-                            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                            UiMessage(this, MSG(44));
+                            UiLog(this, LOG_ERROR, MSG(44));
+                            CloseHandle(hFileRead);
                             return 0;
                         }
 
                         CurrentFrames++;
-
-                        if (Percent < ((CurrentFrames * 100) / TotalFrames))
+                        const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+                        if (Percent < newPct)
                         {
-                            Percent = ((CurrentFrames * 100) / TotalFrames);
-                            Dlg->m_Progress.SetPos(Percent);
-                            Dlg->m_Percent.Format("%d%%", Percent);
-                            PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                            Percent = newPct;
+                            UiProgress(this, (int)Percent);
                         }
                     }
-
                     else
                     {
                         break;
                     }
                 }
             }
-
             else
             {
-                m_LogWnd->AddMessage(LOG_INFO, FileName);
+                UiLog(this, LOG_INFO, FileName);
             }
 
             CloseHandle(hFileRead);
             PrevTrackType = TrackType;
         }
 
-        if (m_StopFlag)
-        {
-            break;
-        }
+        if (m_StopFlag) break;
     }
 
     if (m_CD->GetWritingMode() != WRITEMODE_2048)
     {
-        //   write lead-out
-        Dlg->m_Message = MSG(45);
-        m_LogWnd->AddMessage(LOG_INFO, MSG(45));
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiMessage(this, MSG(45));
+        UiLog(this, LOG_INFO, MSG(45));
 
         for (i = 0; i < 90 * 75; i++)
         {
-            if (m_StopFlag)
-            {
-                return 0;
-            }
+            if (m_StopFlag) return 0;
 
             if (!m_CD->WriteRawGap())
             {
-                Dlg->m_Message = MSG(46);
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(46));
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                UiMessage(this, MSG(46));
+                UiLog(this, LOG_ERROR, MSG(46));
                 return 0;
             }
 
             CurrentFrames++;
-
-            if (Percent < ((CurrentFrames * 100) / TotalFrames))
+            const DWORD newPct = ((CurrentFrames * 100) / TotalFrames);
+            if (Percent < newPct)
             {
-                Percent = ((CurrentFrames * 100) / TotalFrames);
-                Dlg->m_Progress.SetPos(Percent);
-                Dlg->m_Percent.Format("%d%%", Percent);
-                PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+                Percent = newPct;
+                UiProgress(this, (int)Percent);
             }
         }
     }
-
     else
     {
         CurrentFrames += 90 * 75;
@@ -1583,13 +1504,13 @@ DWORD CWriteThread::MasteringSub(void)
 
 bool CWriteThread::CreateCueSheet(CString& CueSheet)
 {
-    auto Dlg = static_cast<CWriteProgressDialog*>(m_ParentWnd);
     int i;
     DWORD TrackType;
     DWORD lba;
     CString cs;
     DWORD PrevTrackType;
     MSFAddress msf;
+
     CueSheet = "";
     PrevTrackType = 0;
     lba = 0;
@@ -1598,87 +1519,83 @@ bool CWriteThread::CreateCueSheet(CString& CueSheet)
     {
         TrackType = m_List->GetItemData(i);
 
-        if (TrackType == 0) //   data track
+        if (TrackType == 0)
         {
             CString tt;
             tt = m_List->GetItemText(0, 1);
 
             if (i != 0)
             {
-                m_LogWnd->AddMessage(LOG_ERROR, MSG(53));
+                UiLog(this, LOG_ERROR, MSG(53));
                 return false;
             }
 
             if (tt == "Mastering")
             {
                 CIsoCreator iso;
-                cs.Format("  TRACK 01 MODE1/2352\n");
+                cs.Format(_T("  TRACK 01 MODE1/2352\n"));
                 CueSheet += cs;
-                cs.Format("    INDEX 01 00:00:00\n");
+                cs.Format(_T("    INDEX 01 00:00:00\n"));
                 CueSheet += cs;
                 iso.SetParams(m_VolumeLabel, theSetting.m_CopyProtectionSize);
                 iso.CreateJolietHeader(m_Dir);
                 lba += iso.GetImageSize();
             }
-
             else
             {
                 DWORD FileSize;
                 HANDLE hFile;
-                CString cs;
-                cs = m_List->GetItemText(i, 2);
-                hFile = CreateFile(cs, 0, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                CString fn;
+                fn = m_List->GetItemText(i, 2);
+                hFile = CreateFile(fn, 0, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 FileSize = GetFileSize(hFile, nullptr);
                 CloseHandle(hFile);
 
                 if (tt == "MODE1/2048")
                 {
-                    cs.Format("  TRACK 01 MODE1/2352\n");
+                    cs.Format(_T("  TRACK 01 MODE1/2352\n"));
                     lba += FileSize / 2048;
                 }
-
                 else if (tt == "MODE1/2352")
                 {
-                    cs.Format("  TRACK 01 MODE1/2352\n");
+                    cs.Format(_T("  TRACK 01 MODE1/2352\n"));
                     lba += FileSize / 2352;
                 }
-
                 else if (tt == "MODE2/2352")
                 {
-                    cs.Format("  TRACK 01 MODE2/2352\n");
+                    cs.Format(_T("  TRACK 01 MODE2/2352\n"));
                     lba += FileSize / 2352;
                 }
 
                 CueSheet += cs;
-                cs.Format("    INDEX 01 00:00:00\n");
+                cs.Format(_T("    INDEX 01 00:00:00\n"));
                 CueSheet += cs;
             }
 
             PrevTrackType = TrackType;
         }
-
-        else //   audio track
+        else
         {
             HANDLE hFile;
             CString FileName;
-            cs.Format("  TRACK %02d AUDIO\n", i + 1);
+
+            cs.Format(_T("  TRACK %02d AUDIO\n"), i + 1);
             CueSheet += cs;
 
             if (i == 1 && PrevTrackType == 0)
             {
                 msf = lba;
-                cs.Format("    INDEX 00 %02d:%02d:%02d\n", msf.Minute, msf.Second, msf.Frame);
+                cs.Format(_T("    INDEX 00 %02d:%02d:%02d\n"), msf.Minute, msf.Second, msf.Frame);
                 CueSheet += cs;
                 lba += 150;
-                msf = lba;
             }
 
             msf = lba;
-            cs.Format("    INDEX 01 %02d:%02d:%02d\n", msf.Minute, msf.Second, msf.Frame);
+            cs.Format(_T("    INDEX 01 %02d:%02d:%02d\n"), msf.Minute, msf.Second, msf.Frame);
             CueSheet += cs;
+
             FileName = m_List->GetItemText(i, 2);
-            hFile = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                               nullptr);
+            hFile = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
             if (SkipAudioHeader(hFile))
             {
@@ -1687,17 +1604,12 @@ bool CWriteThread::CreateCueSheet(CString& CueSheet)
                 ep = SetFilePointer(hFile, 0, nullptr, FILE_END);
                 size = ep - np;
                 lba += size / 2352;
-
-                if (size % 2352)
-                {
-                    lba++;
-                }
+                if (size % 2352) lba++;
             }
-
             else
             {
                 cs.Format(MSG(54), i + 1);
-                m_LogWnd->AddMessage(LOG_ERROR, cs);
+                UiLog(this, LOG_ERROR, cs);
                 CloseHandle(hFile);
                 return false;
             }
@@ -1720,41 +1632,29 @@ struct t_chunk
 bool CWriteThread::SkipAudioHeader(HANDLE hFile)
 {
     if (hFile == INVALID_HANDLE_VALUE)
-    {
         return false;
-    }
 
     struct t_chunk ch;
+    DWORD read = 0;
+    DWORD format = 0;
 
-    DWORD read;
-
-    DWORD format;
-
-    ReadFile(hFile, &ch, sizeof (ch), &read, nullptr);
+    ReadFile(hFile, &ch, sizeof(ch), &read, nullptr);
 
     if (ch.chunk_id != 'FFIR')
-    {
         return false;
-    }
 
-    ReadFile(hFile, &format, sizeof (format), &read, nullptr);
+    ReadFile(hFile, &format, sizeof(format), &read, nullptr);
 
     if (format != 'EVAW')
-    {
         return false;
-    }
 
     while (true)
     {
-        if (!ReadFile(hFile, &ch, sizeof (ch), &read, nullptr))
-        {
+        if (!ReadFile(hFile, &ch, sizeof(ch), &read, nullptr))
             return false;
-        }
 
         if (ch.chunk_id == 'atad')
-        {
             break;
-        }
 
         SetFilePointer(hFile, ch.chunk_size, nullptr, FILE_CURRENT);
     }
@@ -1764,45 +1664,34 @@ bool CWriteThread::SkipAudioHeader(HANDLE hFile)
 
 int CWriteThread::DetectCommand(void)
 {
-    auto Dlg = static_cast<CWriteProgressDialog*>(m_ParentWnd);
-
     if (!theSetting.m_Write_AutoDetectMethod)
     {
         if (theSetting.m_Write_WritingMode > 0)
-        {
-            Dlg->m_RawFlag = MSG(55);
-        }
-
+            UiRawFlag(this, MSG(55));
         else
-        {
-            Dlg->m_RawFlag = MSG(56);
-        }
+            UiRawFlag(this, MSG(56));
 
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
         return theSetting.m_Write_WritingMode;
     }
 
     if (m_CD->SetWritingParams(WRITEMODE_RAW_96, false, false, 10))
     {
-        m_LogWnd->AddMessage(LOG_NORMAL, MSG(57));
-        Dlg->m_RawFlag = MSG(55);
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiLog(this, LOG_NORMAL, MSG(57));
+        UiRawFlag(this, MSG(55));
         return WRITEMODE_RAW_96;
     }
 
     if (m_CD->SetWritingParams(WRITEMODE_RAW_16, false, false, 10))
     {
-        m_LogWnd->AddMessage(LOG_NORMAL, MSG(58));
-        Dlg->m_RawFlag = MSG(55);
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiLog(this, LOG_NORMAL, MSG(58));
+        UiRawFlag(this, MSG(55));
         return WRITEMODE_RAW_16;
     }
 
     if (m_CD->SetWritingParams(WRITEMODE_2048, false, false, 10))
     {
-        m_LogWnd->AddMessage(LOG_NORMAL, MSG(59));
-        Dlg->m_RawFlag = MSG(56);
-        PostMessage(Dlg->m_hWnd, WM_COMMAND, ID_UPDATE_DIALOG, 0);
+        UiLog(this, LOG_NORMAL, MSG(59));
+        UiRawFlag(this, MSG(56));
         return WRITEMODE_2048;
     }
 
