@@ -16,7 +16,7 @@ void CLanguage::read_language(const LPCSTR file_name)
     if (!file.Open(file_name, CFile::modeRead | CFile::typeBinary))
     {
         char buffer[1024];
-        sprintf(buffer, "Can't read language file\nFile:'%s'", file_name);
+        snprintf(buffer, sizeof(buffer), "Can't read language file\nFile:'%s'", file_name);
         MessageBox(nullptr, buffer, "Caution!!", MB_OK);
         return;
     }

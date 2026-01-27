@@ -16,7 +16,7 @@ BYTE* CPBBuffer::CreateBuffer(DWORD BufferSize)
 {
     DeleteBuffer();
     m_Buffer = static_cast<BYTE*>(malloc(BufferSize + 0x0f));
-    m_PBuffer = (BYTE*)(((DWORD)m_Buffer + 0x0f) & ~0x0f);
+    m_PBuffer = reinterpret_cast<BYTE*>((reinterpret_cast<uintptr_t>(m_Buffer) + 0x0f) & ~static_cast<uintptr_t>(0x0f));
     m_BufferLength = BufferSize;
     return m_PBuffer;
 }
