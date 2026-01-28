@@ -1,4 +1,4 @@
-// mmcwriter_fixed.cpp
+﻿// mmcwriter_fixed.cpp
 #include "StdAfx.h"
 #include "mmcwriter.h"
 #include "CDWriter.h"
@@ -14,6 +14,84 @@
 static constexpr DWORD kMaxBufferedFramesHardLimit = 27;
 static constexpr DWORD kMaxFrameSizeBytes = (2352 + 96);
 static constexpr DWORD kBufferCapacityBytes = kMaxFrameSizeBytes * kMaxBufferedFramesHardLimit;
+
+namespace
+{
+    struct SenseTriplet
+    {
+        BYTE sk{ 0 }, asc{ 0 }, ascq{ 0 };
+    };
+
+    static inline SenseTriplet ExtractSense(const SRB_ExecSCSICmd& cmd)
+    {
+        SenseTriplet s;
+        s.sk = cmd.SenseArea[2] & 0x0f;
+        s.asc = cmd.SenseArea[12];
+        s.ascq = cmd.SenseArea[13];
+        return s;
+    }
+
+    static inline bool ScsiExec(CAspi* aspi, SRB_ExecSCSICmd& cmd, SenseTriplet& outSense)
+    {
+        if (!aspi) return false;
+        aspi->ExecuteCommand(cmd);
+        if (cmd.SRB_Status != SS_COMP)
+        {
+            outSense = ExtractSense(cmd);
+            return false;
+        }
+        return true;
+    }
+
+    static inline bool ScsiExecAsync(CAspi* aspi, SRB_ExecSCSICmd& cmd, SenseTriplet& outSense)
+    {
+        if (!aspi) return false;
+        aspi->ExecuteCommandAsync(cmd);
+        if (cmd.SRB_Status != SS_COMP)
+        {
+            outSense = ExtractSense(cmd);
+            return false;
+        }
+        return true;
+    }
+
+    static inline BYTE bcd_to_bin(BYTE v)
+    {
+        return static_cast<BYTE>(((v >> 4) * 10) + (v & 0x0F));
+    }
+
+    struct WriteModeSpec
+    {
+        int  mode;
+        BYTE writeTypeNibble; // low nibble of mp[2]
+        BYTE blockTypeNibble; // low nibble of mp[4]
+        DWORD frameSize;
+    };
+
+    static constexpr WriteModeSpec kWriteSpecs[] = {
+        { WRITEMODE_RAW_96,  0x03, 0x03, 2352 + 96 }, // RAW + raw PW
+        { WRITEMODE_RAW_P96, 0x03, 0x02, 2352 + 96 }, // RAW + packed PW
+        { WRITEMODE_RAW_16,  0x03, 0x01, 2352 + 16 }, // RAW + PQ
+        { WRITEMODE_2048,    0x02, 0x08, 2352       }, // legacy behavior preserved
+    };
+
+    static inline const WriteModeSpec* FindWriteSpec(int writeMode)
+    {
+        for (const auto& s : kWriteSpecs)
+        {
+            if (s.mode == writeMode) return &s;
+        }
+        return nullptr;
+    }
+
+    static inline DWORD ClampMaxFrames(int bufferingFrames)
+    {
+        if (bufferingFrames < 0) return 0;
+        DWORD mf = static_cast<DWORD>(bufferingFrames);
+        if (mf > kMaxBufferedFramesHardLimit) mf = kMaxBufferedFramesHardLimit;
+        return mf;
+    }
+} // namespace
 
 CMMCWriter::CMMCWriter(void)
 {
@@ -37,6 +115,11 @@ CMMCWriter::CMMCWriter(void)
     m_BufferPoint = 0;
     m_BufferLBA = 0;
     m_FrameSize = kMaxFrameSizeBytes; // default (will be set by SetWriteParam)
+
+    // Error defaults
+    m_SK = 0;
+    m_ASC = 0;
+    m_ASCQ = 0;
 }
 
 CMMCWriter::~CMMCWriter(void)
@@ -69,18 +152,17 @@ bool CMMCWriter::CheckDisc(void)
     cmd.CDBByte[7] = static_cast<BYTE>(255 >> 8);
     cmd.CDBByte[8] = static_cast<BYTE>(255 & 0xff);
 
-    m_Aspi->ExecuteCommand(cmd);
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
+    {
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
+        m_LeadInLBA = 0;
+        m_LeadInSize = 0;
+        return false;
+    }
 
     m_LeadInLBA = 0;
     m_LeadInSize = 0;
-
-    if (cmd.SRB_Status != SS_COMP)
-    {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
-        return false;
-    }
 
     if ((Buffer[2] & 0x03) != 0)
     {
@@ -112,6 +194,12 @@ bool CMMCWriter::SetWriteParam(int WriteMode, bool BurnProof, bool TestMode, int
         return false;
     }
 
+    const WriteModeSpec* spec = FindWriteSpec(WriteMode);
+    if (!spec)
+    {
+        return false;
+    }
+
     BYTE* Buffer;
     BYTE B[256 + 15];
     DWORD DataPoint;
@@ -127,7 +215,6 @@ bool CMMCWriter::SetWriteParam(int WriteMode, bool BurnProof, bool TestMode, int
     }
 
     mp = Buffer + DataPoint;
-
     if ((mp[2] & 0x40) == 0)
     {
         BurnProof = false;
@@ -144,72 +231,32 @@ bool CMMCWriter::SetWriteParam(int WriteMode, bool BurnProof, bool TestMode, int
 
     memset(mp + 2, 0, 0x36);
 
-    if (TestMode)
-    {
-        mp[2] |= 0x10; // set test mode
-    }
-    else
-    {
-        mp[2] &= ~0x10;
-    }
+    if (TestMode) mp[2] |= 0x10;
+    else          mp[2] &= static_cast<BYTE>(~0x10);
 
-    if (BurnProof)
-    {
-        mp[2] |= 0x40;
-    }
-    else
-    {
-        mp[2] &= ~0x40;
-    }
+    if (BurnProof) mp[2] |= 0x40;
+    else           mp[2] &= static_cast<BYTE>(~0x40);
 
-    if (WriteMode == WRITEMODE_RAW_96)
-    {
-        mp[2] = (mp[2] & 0xf0) | 0x03; // Write Type : RAW
-        mp[4] = (mp[4] & 0xf0) | 0x03; // 2352 + raw PW sub
-        m_FrameSize = 2352 + 96;
-    }
-    else if (WriteMode == WRITEMODE_RAW_P96)
-    {
-        mp[2] = (mp[2] & 0xf0) | 0x03; // RAW
-        mp[4] = (mp[4] & 0xf0) | 0x02; // 2352 + packed PW sub
-        m_FrameSize = 2352 + 96;
-    }
-    else if (WriteMode == WRITEMODE_RAW_16)
-    {
-        mp[2] = (mp[2] & 0xf0) | 0x03; // RAW
-        mp[4] = (mp[4] & 0xf0) | 0x01; // 2352 + PQ sub
-        m_FrameSize = 2352 + 16;
-    }
-    else if (WriteMode == WRITEMODE_2048)
-    {
-        mp[2] = (mp[2] & 0xf0) | 0x02; // Session at once
-        mp[4] = (mp[4] & 0xf0) | 0x08; // 2048 bytes data
-        m_FrameSize = 2352;
-    }
-    else
-    {
-        return false;
-    }
+    // Apply spec
+    mp[2] = static_cast<BYTE>((mp[2] & 0xF0) | (spec->writeTypeNibble & 0x0F));
+    mp[4] = static_cast<BYTE>((mp[4] & 0xF0) | (spec->blockTypeNibble & 0x0F));
+    m_FrameSize = spec->frameSize;
 
     if (!m_Aspi->ModeSelect(Buffer, PageLen + DataPoint))
     {
         return false;
     }
 
-    // reset buffering state
+    // reset buffering state (must be done inside member function)
     m_BufferingFrames = 0;
     m_BufferPoint = 0;
     m_BufferLBA = 0;
     m_FirstWriteFlag = true;
     m_WritingMode = WriteMode;
 
-    m_MaxFrames = (BufferingFrames < 0) ? 0 : static_cast<DWORD>(BufferingFrames);
-    if (m_MaxFrames > kMaxBufferedFramesHardLimit)
-    {
-        m_MaxFrames = kMaxBufferedFramesHardLimit;
-    }
-
+    m_MaxFrames = ClampMaxFrames(BufferingFrames);
     m_Buffer = m_Buffer1;
+
     return true;
 }
 
@@ -245,8 +292,6 @@ bool CMMCWriter::WriteBuffering(BYTE* Buffer, DWORD lba)
 
     if (m_MaxFrames == 0)
     {
-        // If buffering disabled, write immediately as 1 frame.
-        m_BufferPoint = m_FrameSize;
         return Write(Buffer, lba, 1);
     }
 
@@ -256,7 +301,6 @@ bool CMMCWriter::WriteBuffering(BYTE* Buffer, DWORD lba)
         m_BufferLBA = lba;
     }
 
-    // capacity guard
     if (m_BufferPoint + m_FrameSize > kBufferCapacityBytes)
     {
         return false;
@@ -285,7 +329,6 @@ bool CMMCWriter::WriteBufferingEx(BYTE* Buffer, DWORD lba, DWORD Size)
         return false;
     }
 
-    // Require whole frames; otherwise WRITE(10) transfer length won't match payload
     if (m_FrameSize == 0 || (Size % m_FrameSize) != 0)
     {
         return false;
@@ -295,9 +338,6 @@ bool CMMCWriter::WriteBufferingEx(BYTE* Buffer, DWORD lba, DWORD Size)
 
     if (m_MaxFrames == 0)
     {
-        // buffering disabled, write immediately
-        // We'll write in one command for the frames in Size.
-        m_BufferPoint = Size;
         return Write(Buffer, lba, framesToAdd);
     }
 
@@ -307,7 +347,6 @@ bool CMMCWriter::WriteBufferingEx(BYTE* Buffer, DWORD lba, DWORD Size)
         m_BufferLBA = lba;
     }
 
-    // capacity guard
     if (m_BufferPoint + Size > kBufferCapacityBytes)
     {
         return false;
@@ -341,7 +380,6 @@ bool CMMCWriter::Write(BYTE* Buffer, DWORD lba, DWORD WriteLen)
         return true;
     }
 
-    // Transfer length in blocks; buffer length must match blocks * frame size.
     const DWORD BufferLength = WriteLen * m_FrameSize;
 
     if (m_FirstWriteFlag)
@@ -366,16 +404,12 @@ bool CMMCWriter::Write(BYTE* Buffer, DWORD lba, DWORD WriteLen)
     cmd.CDBByte[7] = static_cast<BYTE>(WriteLen >> 8);
     cmd.CDBByte[8] = static_cast<BYTE>(WriteLen >> 0);
 
-    m_Aspi->ExecuteCommandAsync(cmd);
-
-    if (cmd.SRB_Status != SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExecAsync(m_Aspi, cmd, s))
     {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
         return false;
     }
-
     return true;
 }
 
@@ -397,23 +431,15 @@ int CMMCWriter::TestUnitReady(void)
 
     if (cmd.SRB_Status != SS_COMP)
     {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
-        return 1; // bad status
+        SenseTriplet s = ExtractSense(cmd);
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
+        return 1;
     }
 
-    if ((cmd.SenseArea[2] & 0x0f) == 2)
-    {
-        return 2; // not ready
-    }
+    if ((cmd.SenseArea[2] & 0x0f) == 2) return 2;
+    if ((cmd.SenseArea[2] & 0x0f) == 6) return 2;
 
-    if ((cmd.SenseArea[2] & 0x0f) == 6)
-    {
-        return 2; // illegal request (treated as not-ready)
-    }
-
-    return 0; // ready
+    return 0;
 }
 
 bool CMMCWriter::FlushBuffer(void)
@@ -423,7 +449,6 @@ bool CMMCWriter::FlushBuffer(void)
         return false;
     }
 
-    // write remaining buffered frames
     if (m_BufferingFrames != 0)
     {
         if (!Write(m_Buffer, m_BufferLBA, m_BufferingFrames))
@@ -444,22 +469,13 @@ bool CMMCWriter::FlushBuffer(void)
     cmd.SRB_Flags = SRB_DIR_OUT;
     cmd.CDBByte[0] = 0x35; // SYNCHRONIZE CACHE
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status != SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
     {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
         return false;
     }
-
     return true;
-}
-
-static inline BYTE bcd_to_bin(BYTE v)
-{
-    return static_cast<BYTE>(((v >> 4) * 10) + (v & 0x0F));
 }
 
 bool CMMCWriter::SetCueSheet(BYTE* Buffer, int EntryNumber)
@@ -481,7 +497,6 @@ bool CMMCWriter::SetCueSheet(BYTE* Buffer, int EntryNumber)
 
     // Patch -> modify cue-sheet
     {
-        // regenerate lead-in pregap
         memcpy(CueBuffer, Buffer, BufferLength);
         memset(CueBuffer + 4, 0, 4);
 
@@ -511,16 +526,12 @@ bool CMMCWriter::SetCueSheet(BYTE* Buffer, int EntryNumber)
     cmd.CDBByte[7] = static_cast<BYTE>(BufferLength >> 8);
     cmd.CDBByte[8] = static_cast<BYTE>(BufferLength >> 0);
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status != SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
     {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
         return false;
     }
-
     return true;
 }
 
@@ -539,16 +550,12 @@ bool CMMCWriter::PerformPowerCalibration(void)
     cmd.CDBByte[0] = 0x54; // SEND OPC INFORMATION
     cmd.CDBByte[1] = 0x01;
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status != SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
     {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
         return false;
     }
-
     return true;
 }
 
@@ -567,16 +574,12 @@ bool CMMCWriter::PreventMediaRemoval(bool BlockFlag)
     cmd.CDBByte[0] = 0x1E; // PREVENT/ALLOW MEDIA REMOVAL
     cmd.CDBByte[4] = BlockFlag ? 0x01 : 0x00;
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status != SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
     {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
         return false;
     }
-
     return true;
 }
 
@@ -594,16 +597,12 @@ bool CMMCWriter::ReWind(void)
     cmd.SRB_CDBLen = 6;
     cmd.CDBByte[0] = 0x01; // REWIND
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status != SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
     {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
         return false;
     }
-
     return true;
 }
 
@@ -622,16 +621,12 @@ bool CMMCWriter::LoadTray(BYTE LoUnlo)
     cmd.CDBByte[0] = 0x1b; // LOAD/UNLOAD
     cmd.CDBByte[4] = LoUnlo;
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status != SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
     {
-        m_SK = cmd.SenseArea[2] & 0x0f;
-        m_ASC = cmd.SenseArea[12];
-        m_ASCQ = cmd.SenseArea[13];
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
         return false;
     }
-
     return true;
 }
 
@@ -710,17 +705,13 @@ bool CMMCWriter::SetWriteSpeed(BYTE Speed)
     cmd.CDBByte[4] = static_cast<BYTE>(PSpeed >> 8);
     cmd.CDBByte[5] = static_cast<BYTE>(PSpeed);
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status == SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
     {
-        return true;
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
+        return false;
     }
-
-    m_SK = cmd.SenseArea[2] & 0x0f;
-    m_ASC = cmd.SenseArea[12];
-    m_ASCQ = cmd.SenseArea[13];
-    return false;
+    return true;
 }
 
 bool CMMCWriter::EraseMedia(bool FastErase)
@@ -738,17 +729,13 @@ bool CMMCWriter::EraseMedia(bool FastErase)
     cmd.CDBByte[0] = 0xA1; // BLANK
     cmd.CDBByte[1] = FastErase ? 1 : 0;
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status == SS_COMP)
+    SenseTriplet s{};
+    if (!ScsiExec(m_Aspi, cmd, s))
     {
-        return true;
+        m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
+        return false;
     }
-
-    m_SK = cmd.SenseArea[2] & 0x0f;
-    m_ASC = cmd.SenseArea[12];
-    m_ASCQ = cmd.SenseArea[13];
-    return false;
+    return true;
 }
 
 void CMMCWriter::GetErrorParams(BYTE& SK, BYTE& ASC, BYTE& ASCQ)
@@ -779,16 +766,13 @@ bool CMMCWriter::ReadTrackInfo(BYTE* Buffer)
     cmd.CDBByte[5] = 0xff;
     cmd.CDBByte[8] = 0x1c;
 
-    m_Aspi->ExecuteCommand(cmd);
-
-    if (cmd.SRB_Status == SS_COMP)
+    SenseTriplet s{};
+    if (ScsiExec(m_Aspi, cmd, s))
     {
         memcpy(Buffer, PBuffer.GetBuffer(), 36);
         return true;
     }
 
-    m_SK = cmd.SenseArea[2] & 0x0f;
-    m_ASC = cmd.SenseArea[12];
-    m_ASCQ = cmd.SenseArea[13];
+    m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
     return false;
 }

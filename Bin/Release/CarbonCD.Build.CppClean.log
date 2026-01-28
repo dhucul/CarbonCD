@@ -41,7 +41,6 @@ c:\users\dhucu\carboncd\bin\release\masteringfiledialog.obj
 c:\users\dhucu\carboncd\bin\release\logwindow.obj
 c:\users\dhucu\carboncd\bin\release\languagedialog.obj
 c:\users\dhucu\carboncd\bin\release\language.obj
-c:\users\dhucu\carboncd\bin\release\writeprogressdialog.obj
 c:\users\dhucu\carboncd\bin\release\tocwindow.obj
 c:\users\dhucu\carboncd\bin\release\themecontroller.obj
 c:\users\dhucu\carboncd\bin\release\subqthread.obj
@@ -49,6 +48,7 @@ c:\users\dhucu\carboncd\bin\release\subqprogressdialog.obj
 c:\users\dhucu\carboncd\bin\release\subcodegeneratorms.obj
 c:\users\dhucu\carboncd\bin\release\subcodegenerator.obj
 c:\users\dhucu\carboncd\bin\release\sptidriver.obj
+c:\users\dhucu\carboncd\bin\release\sptidiag.obj
 c:\users\dhucu\carboncd\bin\release\settingpage4.obj
 c:\users\dhucu\carboncd\bin\release\settingpage3.obj
 c:\users\dhucu\carboncd\bin\release\settingpage2.obj
@@ -62,6 +62,7 @@ c:\users\dhucu\carboncd\bin\release\readthreadcompare.obj
 c:\users\dhucu\carboncd\bin\release\readthreadalpha.obj
 c:\users\dhucu\carboncd\bin\release\readthread.obj
 c:\users\dhucu\carboncd\bin\release\writesettingdialog.obj
+c:\users\dhucu\carboncd\bin\release\writeprogressdialog.obj
 c:\users\dhucu\carboncd\bin\release\writethread.obj
 c:\users\dhucu\carboncd\bin\release\carboncd.exe
 c:\users\dhucu\carboncd\bin\release\carboncd.pdb

@@ -17,15 +17,17 @@
 #endif
 
 // Wrapper that includes a sense buffer.
-// (Windows provides SCSI_PASS_THROUGH_DIRECT, but not this exact convenience wrapper.)
-#pragma pack(push, 1)
+//
+// IMPORTANT:
+// Do NOT pack this struct. SCSI_PASS_THROUGH_DIRECT contains pointer fields and
+// expects natural alignment. Packing can lead to bogus behavior such as sense
+// always reading as 00/00/00 or IOCTL oddities.
 struct SPTD_WITH_SENSE
 {
     SCSI_PASS_THROUGH_DIRECT sptd;
-    ULONG Filler;            // alignment
+    ULONG Filler;            // alignment / pad
     UCHAR Sense[32];
 };
-#pragma pack(pop)
 
 class CSptiDriver : public CAspi
 {

@@ -3,8 +3,38 @@
 #include "Setting.h"
 
 #include <VersionHelpers.h>
-#include <chrono>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <chrono>
+
+// ------------------------------------------------------------
+// Debug logging: define SPTI_DEBUG_LOG in project settings
+// ------------------------------------------------------------
+// #define SPTI_DEBUG_LOG 1
+
+#ifdef SPTI_DEBUG_LOG
+static void dbgprintf(const char* fmt, ...)
+{
+    char buf[2048] = {};
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    ::OutputDebugStringA(buf);
+}
+
+static void dump_hex32(const char* label, const BYTE* p, size_t n)
+{
+    if (!p || n == 0) { dbgprintf("%s: <none>\n", label); return; }
+    dbgprintf("%s:", label);
+    for (size_t i = 0; i < n; ++i) dbgprintf(" %02X", (unsigned)p[i]);
+    dbgprintf("\n");
+}
+#else
+static void dbgprintf(const char*, ...) {}
+static void dump_hex32(const char*, const BYTE*, size_t) {}
+#endif
 
 // ------------------------------
 // helpers
@@ -21,20 +51,53 @@ static bool IsSenseValid(const BYTE* s)
     return (rc == 0x70 || rc == 0x71 || rc == 0x72 || rc == 0x73);
 }
 
-static void DecodeSenseFixed(const BYTE* s, int& key, int& asc, int& ascq)
+// Robust: fixed (0x70/0x71) and descriptor (0x72/0x73)
+static bool DecodeSense(const BYTE* s, int& key, int& asc, int& ascq)
 {
-    key = s[2] & 0x0F;
-    asc = s[12];
-    ascq = s[13];
+    key = asc = ascq = -1;
+    if (!IsSenseValid(s)) return false;
+
+    const BYTE rc = s[0] & 0x7F;
+    if (rc == 0x70 || rc == 0x71)
+    {
+        key = s[2] & 0x0F;
+        asc = s[12];
+        ascq = s[13];
+        return true;
+    }
+    if (rc == 0x72 || rc == 0x73)
+    {
+        key = s[1] & 0x0F;
+        asc = s[2];
+        ascq = s[3];
+        return true;
+    }
+    return false;
 }
 
-// SK=02 ASC=04 ASCQ=08 (LOGICAL UNIT NOT READY / LONG WRITE IN PROGRESS)
+static bool SenseIs(const BYTE* s, int k, int a, int q)
+{
+    int key, asc, ascq;
+    if (!DecodeSense(s, key, asc, ascq)) return false;
+    return (key == k && asc == a && ascq == q);
+}
+
+// 02/04/08 LONG WRITE IN PROGRESS
 static bool IsLongWriteInProgress(const BYTE* s)
 {
-    if (!IsSenseValid(s)) return false;
-    int k, a, q;
-    DecodeSenseFixed(s, k, a, q);
-    return (k == 0x02 && a == 0x04 && q == 0x08);
+    return SenseIs(s, 0x02, 0x04, 0x08);
+}
+
+// 02/04/01 BECOMING READY
+static bool IsBecomingReady(const BYTE* s)
+{
+    return SenseIs(s, 0x02, 0x04, 0x01);
+}
+
+// 02/3A/02 MEDIUM NOT PRESENT - TRAY OPEN
+static bool IsNoMediumTrayOpen(const BYTE* s)
+{
+    return SenseIs(s, 0x02, 0x3A, 0x02);
 }
 
 static bool IsWriteLikeOpcode(BYTE op)
@@ -55,63 +118,64 @@ static bool IsWriteLikeOpcode(BYTE op)
     }
 }
 
-// ------------------------------
-// thread
-// ------------------------------
-DWORD WINAPI CSptiDriver::thread_proc(LPVOID p)
+// For many apps the most useful behavior is:
+// - If CHECK CONDITION says "becoming ready" or "long write in progress": wait and retry.
+// - If "no medium/tray open": wait a bit and retry (lets user insert disc instead of instant abort).
+static bool ShouldWaitAndRetryOnSense(const BYTE* sense)
 {
-    CSptiDriver* d = static_cast<CSptiDriver*>(p);
-    DWORD bytesReturned = 0;
+    return IsBecomingReady(sense) || IsLongWriteInProgress(sense) || IsNoMediumTrayOpen(sense);
+}
 
-    while (true)
+static const char* ScsiStatusName(BYTE st)
+{
+    switch (st)
     {
-        ::WaitForSingleObject(d->m_CommandEvent.get(), INFINITE);
-
-        if (d->m_ExitFlag.load(std::memory_order_relaxed))
-            break;
-
-        d->m_Status = ::DeviceIoControl(
-            d->m_Device.get(),
-            IOCTL_SCSI_PASS_THROUGH_DIRECT,
-            &d->m_Spti, sizeof(d->m_Spti),
-            &d->m_Spti, sizeof(d->m_Spti),
-            &bytesReturned,
-            NULL);
-
-        // Retry "long write in progress" for write-like ops
-        if (d->m_Status &&
-            d->m_Spti.sptd.ScsiStatus == 0x02 &&
-            IsLongWriteInProgress(d->m_Spti.Sense) &&
-            IsWriteLikeOpcode(d->m_Spti.sptd.Cdb[0]))
-        {
-            using namespace std::chrono;
-
-            const auto kMaxWait = 5min;
-            const auto kStep = 200ms;
-
-            auto waited = 0ms;
-            while (waited < kMaxWait)
-            {
-                ::Sleep((DWORD)kStep.count());
-                waited += kStep;
-
-                d->m_Status = ::DeviceIoControl(
-                    d->m_Device.get(),
-                    IOCTL_SCSI_PASS_THROUGH_DIRECT,
-                    &d->m_Spti, sizeof(d->m_Spti),
-                    &d->m_Spti, sizeof(d->m_Spti),
-                    &bytesReturned,
-                    NULL);
-
-                if (d->m_Status && d->m_Spti.sptd.ScsiStatus == 0)
-                    break;
-            }
-        }
-
-        ::SetEvent(d->m_WaitEvent.get());
+    case 0x00: return "GOOD";
+    case 0x02: return "CHECK_CONDITION";
+    case 0x08: return "BUSY";
+    default:   return "OTHER";
     }
+}
 
-    return 0;
+static void LogSptiResult(const char* tag, const SPTD_WITH_SENSE& spti, BOOL ok, DWORD gle)
+{
+#ifdef SPTI_DEBUG_LOG
+    const BYTE op = spti.sptd.Cdb[0];
+    dbgprintf("[%s] ok=%d GLE=%lu op=%02X ScsiStatus=%02X(%s) sense0=%02X\n",
+        tag,
+        (int)ok,
+        (unsigned long)gle,
+        (unsigned)op,
+        (unsigned)spti.sptd.ScsiStatus,
+        ScsiStatusName((BYTE)spti.sptd.ScsiStatus),
+        (unsigned)(spti.Sense[0]));
+
+    dump_hex32("[cdb]", spti.sptd.Cdb, spti.sptd.CdbLength);
+
+    if (ok && spti.sptd.ScsiStatus == 0x02)
+    {
+        int k = -1, a = -1, q = -1;
+        DecodeSense(spti.Sense, k, a, q);
+        dbgprintf("[sense] key=%02X asc=%02X ascq=%02X\n", (unsigned)k, (unsigned)a, (unsigned)q);
+        dump_hex32("[sense32]", spti.Sense, sizeof(spti.Sense));
+    }
+#else
+    (void)tag; (void)spti; (void)ok; (void)gle;
+#endif
+}
+
+static BOOL DoSptiIoctl(
+    HANDLE h,
+    SPTD_WITH_SENSE& spti,
+    DWORD& bytesReturned)
+{
+    return ::DeviceIoControl(
+        h,
+        IOCTL_SCSI_PASS_THROUGH_DIRECT,
+        &spti, sizeof(spti),
+        &spti, sizeof(spti),
+        &bytesReturned,
+        NULL);
 }
 
 // ------------------------------
@@ -125,6 +189,7 @@ CSptiDriver::CSptiDriver()
     m_ExitFlag.store(false, std::memory_order_relaxed);
     m_Status = FALSE;
 
+    // If you still have async users, keep the thread. Otherwise you can remove it.
     m_Thread.reset(::CreateThread(NULL, 0, &CSptiDriver::thread_proc, this, 0, &m_ThreadID));
 
     Initialize();
@@ -138,7 +203,7 @@ CSptiDriver::~CSptiDriver()
 }
 
 DWORD CSptiDriver::GetVersion() { return 1; }
-BOOL CSptiDriver::IsActive() { return IsWindowsNT() ? TRUE : FALSE; }
+BOOL  CSptiDriver::IsActive() { return IsWindowsNT() ? TRUE : FALSE; }
 
 void CSptiDriver::Initialize()
 {
@@ -167,7 +232,6 @@ int CSptiDriver::GetCurrentDevice() { return m_CurrentDevice; }
 void CSptiDriver::open_device_by_letter(char driveLetter)
 {
     char path[8] = {};
-    // \\.\D:
     std::snprintf(path, sizeof(path), "\\\\.\\%c:", driveLetter);
 
     m_Device.reset(::CreateFileA(
@@ -206,13 +270,11 @@ void CSptiDriver::GetDeviceString(CString& Vendor, CString& Product, CString& Re
     std::memset(&cmd, 0, sizeof(cmd));
 
     BYTE buf[100] = {};
-
     cmd.SRB_BufLen = sizeof(buf);
     cmd.SRB_BufPointer = buf;
     cmd.SRB_Flags = SRB_DIR_IN;
     cmd.SRB_CDBLen = 6;
-
-    cmd.CDBByte[0] = 0x12;           // INQUIRY
+    cmd.CDBByte[0] = 0x12; // INQUIRY
     cmd.CDBByte[4] = (BYTE)sizeof(buf);
 
     ExecuteCommand(cmd);
@@ -223,9 +285,7 @@ void CSptiDriver::GetDeviceString(CString& Vendor, CString& Product, CString& Re
         CStringA pA((LPCSTR)(buf + 16), 16);
         CStringA rA((LPCSTR)(buf + 32), 4);
 
-        vA.TrimRight();
-        pA.TrimRight();
-        rA.TrimRight();
+        vA.TrimRight(); pA.TrimRight(); rA.TrimRight();
 
         Vendor = CString(vA);
         Product = CString(pA);
@@ -247,50 +307,88 @@ void CSptiDriver::ExecuteCommand(SRB_ExecSCSICmd& cmd)
     if (!m_Device)
         return;
 
-    std::memset(&m_Spti, 0, sizeof(m_Spti));
+    // Build a *local* spti to avoid races and accidental overwrites.
+    SPTD_WITH_SENSE spti;
+    std::memset(&spti, 0, sizeof(spti));
 
-    m_Spti.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
-    m_Spti.sptd.CdbLength = cmd.SRB_CDBLen;
-    m_Spti.sptd.SenseInfoLength = (UCHAR)sizeof(m_Spti.Sense);
-    m_Spti.sptd.SenseInfoOffset = (ULONG)offsetof(SPTD_WITH_SENSE, Sense);
-    m_Spti.sptd.DataTransferLength = cmd.SRB_BufLen;
+    spti.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    spti.sptd.CdbLength = cmd.SRB_CDBLen;
+    spti.sptd.SenseInfoLength = (UCHAR)sizeof(spti.Sense);
+    spti.sptd.SenseInfoOffset = (ULONG)offsetof(SPTD_WITH_SENSE, Sense);
+    spti.sptd.DataTransferLength = cmd.SRB_BufLen;
 
-    // Keep legacy timeout behavior (very long); if you want this configurable, say so.
-    m_Spti.sptd.TimeOutValue = 0xFFFF;
+    // keep legacy very long timeout
+    spti.sptd.TimeOutValue = 0xFFFF;
 
-    std::memcpy(m_Spti.sptd.Cdb, cmd.CDBByte, sizeof(m_Spti.sptd.Cdb));
-    m_Spti.sptd.DataBuffer = cmd.SRB_BufPointer;
+    std::memcpy(spti.sptd.Cdb, cmd.CDBByte, sizeof(spti.sptd.Cdb));
+    spti.sptd.DataBuffer = cmd.SRB_BufPointer;
 
     if (cmd.SRB_Flags & SRB_DIR_IN)
-        m_Spti.sptd.DataIn = SCSI_IOCTL_DATA_IN;
+        spti.sptd.DataIn = SCSI_IOCTL_DATA_IN;
     else if (cmd.SRB_Flags & SRB_DIR_OUT)
-        m_Spti.sptd.DataIn = SCSI_IOCTL_DATA_OUT;
+        spti.sptd.DataIn = SCSI_IOCTL_DATA_OUT;
     else
-        m_Spti.sptd.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED;
+        spti.sptd.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED;
+
+    const BYTE op = spti.sptd.Cdb[0];
+    const bool writeLike = IsWriteLikeOpcode(op);
 
     DWORD bytesReturned = 0;
-    const BOOL ok = ::DeviceIoControl(
-        m_Device.get(),
-        IOCTL_SCSI_PASS_THROUGH_DIRECT,
-        &m_Spti, sizeof(m_Spti),
-        &m_Spti, sizeof(m_Spti),
-        &bytesReturned,
-        NULL);
+    BOOL ok = DoSptiIoctl(m_Device.get(), spti, bytesReturned);
+    DWORD gle = ok ? 0 : ::GetLastError();
+
+    LogSptiResult("sync", spti, ok, gle);
 
     if (!ok)
         return;
 
-    // status 0 == GOOD
-    if (m_Spti.sptd.ScsiStatus == 0)
-        cmd.SRB_Status = SS_COMP;
+    // If device says CHECK CONDITION, decode sense and optionally wait/retry.
+    if (spti.sptd.ScsiStatus == 0x02 && writeLike && ShouldWaitAndRetryOnSense(spti.Sense))
+    {
+        using namespace std::chrono;
+        const auto kStep = 200ms;
+        const auto kMaxWait = 5min;
 
-    // Copy sense into caller buffer (best-effort, avoids breaking old callers)
-    std::memcpy(cmd.SenseArea, m_Spti.Sense, (sizeof(cmd.SenseArea) < sizeof(m_Spti.Sense)) ? sizeof(cmd.SenseArea) : sizeof(m_Spti.Sense));
+        auto waited = 0ms;
+        while (waited < kMaxWait)
+        {
+            ::Sleep((DWORD)kStep.count());
+            waited += kStep;
+
+            std::memset(spti.Sense, 0, sizeof(spti.Sense));
+            ok = DoSptiIoctl(m_Device.get(), spti, bytesReturned);
+            gle = ok ? 0 : ::GetLastError();
+
+            LogSptiResult("retry", spti, ok, gle);
+
+            if (!ok)
+                return;
+
+            if (spti.sptd.ScsiStatus == 0x00)
+                break;
+
+            if (!(spti.sptd.ScsiStatus == 0x02 && ShouldWaitAndRetryOnSense(spti.Sense)))
+                break;
+        }
+    }
+
+    // success only if GOOD
+    if (spti.sptd.ScsiStatus == 0x00)
+        cmd.SRB_Status = SS_COMP;
+    else
+        cmd.SRB_Status = SS_ERR;
+
+    // Copy sense to caller (best-effort, bounded)
+    const size_t toCopy = (sizeof(cmd.SenseArea) < sizeof(spti.Sense)) ? sizeof(cmd.SenseArea) : sizeof(spti.Sense);
+    std::memcpy(cmd.SenseArea, spti.Sense, toCopy);
+
+    // Keep last status snapshot for anyone inspecting driver state
+    std::memcpy(&m_Spti, &spti, sizeof(spti));
+    m_Status = ok;
 }
 
 void CSptiDriver::InitialAsync()
 {
-    // Option 2: keep API but do not change execution semantics.
     if (m_WaitEvent) ::SetEvent(m_WaitEvent.get());
 }
 
@@ -301,6 +399,72 @@ void CSptiDriver::FinalizeAsync()
 
 bool CSptiDriver::ExecuteCommandAsync(SRB_ExecSCSICmd& /*cmd*/)
 {
-    // Option 2: keep API but explicitly not supported here (call ExecuteCommand instead).
     return false;
+}
+
+// ------------------------------
+// thread (kept for compatibility)
+// ------------------------------
+DWORD WINAPI CSptiDriver::thread_proc(LPVOID p)
+{
+    CSptiDriver* d = static_cast<CSptiDriver*>(p);
+    DWORD bytesReturned = 0;
+
+    SPTD_WITH_SENSE localSpti;
+
+    while (true)
+    {
+        ::WaitForSingleObject(d->m_CommandEvent.get(), INFINITE);
+
+        if (d->m_ExitFlag.load(std::memory_order_relaxed))
+            break;
+
+        std::memcpy(&localSpti, &d->m_Spti, sizeof(localSpti));
+
+        BOOL ok = DoSptiIoctl(d->m_Device.get(), localSpti, bytesReturned);
+        DWORD gle = ok ? 0 : ::GetLastError();
+        d->m_Status = ok;
+
+        LogSptiResult("thread", localSpti, ok, gle);
+
+        // same wait/retry policy for write-like ops
+        const BYTE op = localSpti.sptd.Cdb[0];
+        if (ok &&
+            localSpti.sptd.ScsiStatus == 0x02 &&
+            IsWriteLikeOpcode(op) &&
+            ShouldWaitAndRetryOnSense(localSpti.Sense))
+        {
+            using namespace std::chrono;
+            const auto kStep = 200ms;
+            const auto kMaxWait = 5min;
+
+            auto waited = 0ms;
+            while (waited < kMaxWait)
+            {
+                ::Sleep((DWORD)kStep.count());
+                waited += kStep;
+
+                std::memset(localSpti.Sense, 0, sizeof(localSpti.Sense));
+                ok = DoSptiIoctl(d->m_Device.get(), localSpti, bytesReturned);
+                gle = ok ? 0 : ::GetLastError();
+                d->m_Status = ok;
+
+                LogSptiResult("thread-retry", localSpti, ok, gle);
+
+                if (!ok)
+                    break;
+
+                if (localSpti.sptd.ScsiStatus == 0x00)
+                    break;
+
+                if (!(localSpti.sptd.ScsiStatus == 0x02 && ShouldWaitAndRetryOnSense(localSpti.Sense)))
+                    break;
+            }
+        }
+
+        std::memcpy(&d->m_Spti, &localSpti, sizeof(localSpti));
+        ::SetEvent(d->m_WaitEvent.get());
+    }
+
+    return 0;
 }

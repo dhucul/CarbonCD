@@ -7,18 +7,23 @@
 #include "WriteProgressDialog.h"
 #include "Setting.h"
 
-//   test
+// test
 #include "ThemeController.h"
 #include "./masteringfiledialog.h"
 
-#define STR(i)  (theSetting.m_Lang.m_Str[LP_MASTERING + i])
+// Win32 helpers used in this file
+#include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+
+#define STR(i)  (theSetting.m_Lang.m_Str[LP_MASTERING + (i)])
 
 IMPLEMENT_DYNAMIC(CMasteringFileDialog, CDialog)
 
 CMasteringFileDialog::CMasteringFileDialog(CWnd* pParent /*=NULL*/)
     : CDialog(IDD, pParent)
-      , m_Size(_T(""))
-      , m_LogWnd(nullptr)
+    , m_Size(_T(""))
+    , m_LogWnd(nullptr)
 {
     m_LeadOutPos = 0;
     m_TrackList = &(m_Page1.m_TrackList);
@@ -39,7 +44,6 @@ void CMasteringFileDialog::DoDataExchange(CDataExchange* pDX)
     DDX_Text(pDX, IDC_IMAGESIZE, m_Size);
     DDX_Control(pDX, IDC_DRIVELIST, m_DriveList);
 }
-
 
 BEGIN_MESSAGE_MAP(CMasteringFileDialog, CDialog)
     ON_COMMAND(ID_EDIT_ADDFOLDER, OnEditAddfolder)
@@ -63,34 +67,45 @@ BEGIN_MESSAGE_MAP(CMasteringFileDialog, CDialog)
     ON_COMMAND(ID_CD_ERASE_FAST, OnCdEraseFast)
 END_MESSAGE_MAP()
 
-
 BOOL CMasteringFileDialog::OnInitDialog()
 {
     CDialog::OnInitDialog();
+
     m_Dir.m_RealFileName = "image.iso";
     m_Dir.m_ImageFileName = "ISO_Image:\\";
+
     m_Tab.InsertItem(0, STR(3));
     m_Tab.InsertItem(1, STR(4));
     m_Tab.InsertItem(2, STR(19));
     m_Tab.SetCurSel(1);
+
     m_Size = STR(5) + " 00:00:00";
+
     SetLanguage();
+
     m_Page1.m_MainDialog = this;
     m_Page2.m_Dir = &m_Dir;
     m_Page2.m_Page1 = &m_Page1;
     m_Page2.m_MainDialog = this;
     m_Page3.m_MainDialog = this;
+
     m_Page1.Create(IDD_MASTERING_1, this);
     m_Page2.Create(IDD_MASTERING_2, this);
     m_Page3.Create(IDD_MASTERING_3, this);
+
     m_TrackList = &(m_Page1.m_TrackList);
+
     theTheme.EnableThemeDialogTexture(m_Page1.m_hWnd, ETDT_ENABLETAB);
     theTheme.EnableThemeDialogTexture(m_Page2.m_hWnd, ETDT_ENABLETAB);
     theTheme.EnableThemeDialogTexture(m_Page3.m_hWnd, ETDT_ENABLETAB);
+
     ChangeTab();
     UpdateDialog(FALSE);
+
     CalcSize();
+
     m_Tab.SetWindowPos(&wndBottom, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
     m_DriveList.InitializeShortVer(m_CD->GetAspiCtrl());
     m_DriveList.SetCurSel(m_CD->GetAspiCtrl()->GetCurrentDevice());
 
@@ -99,7 +114,7 @@ BOOL CMasteringFileDialog::OnInitDialog()
         SetWindowPos(&wndTopMost, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
 
-    return TRUE; // return TRUE unless you set the focus to a control
+    return TRUE;
 }
 
 void CMasteringFileDialog::OnEditAddfolder()
@@ -107,21 +122,12 @@ void CMasteringFileDialog::OnEditAddfolder()
     if (m_Page2.GetStyle() & 0x10000000)
     {
         CString cs;
-        int i;
-        HTREEITEM ht;
-        ht = m_Tree->GetSelectedItem();
+        HTREEITEM ht = m_Tree->GetSelectedItem();
 
-        for (i = 0; i < 100; i++)
+        for (int i = 0; i < 100; i++)
         {
-            if (i == 0)
-            {
-                cs = MSG(83);
-            }
-
-            else
-            {
-                cs.Format(MSG(84), i);
-            }
+            if (i == 0) cs = MSG(83);
+            else        cs.Format(MSG(84), i);
 
             if (m_Page2.AddFolder(cs))
             {
@@ -136,13 +142,10 @@ void CMasteringFileDialog::OnEditLabel()
 {
     if (m_Page2.GetStyle() & 0x10000000)
     {
-        int id;
-        POSITION pos;
-        pos = m_List->GetFirstSelectedItemPosition();
-
+        POSITION pos = m_List->GetFirstSelectedItemPosition();
         if (pos != nullptr)
         {
-            id = m_List->GetNextSelectedItem(pos);
+            int id = m_List->GetNextSelectedItem(pos);
             m_List->EditLabel(id);
         }
     }
@@ -208,12 +211,16 @@ void CMasteringFileDialog::OnTrackIso()
 {
     if (m_Page1.GetStyle() & 0x10000000)
     {
-        CFileDialog dlg(TRUE, nullptr, nullptr, OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT | OFN_ALLOWMULTISELECT, MSG(90));
+        CFileDialog dlg(TRUE, nullptr, nullptr,
+            OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT | OFN_ALLOWMULTISELECT,
+            MSG(90));
+
         char buf[2048];
-        char* p;
-        m_Page1.UpdateData(TRUE);
         buf[0] = '\0';
-        p = dlg.m_ofn.lpstrFile;
+
+        m_Page1.UpdateData(TRUE);
+
+        char* old = dlg.m_ofn.lpstrFile;
         dlg.m_ofn.lpstrFile = buf;
         dlg.m_ofn.nMaxFile = 2048;
 
@@ -222,13 +229,14 @@ void CMasteringFileDialog::OnTrackIso()
             m_Page1.InsertIsoTrack(dlg.GetPathName());
         }
 
-        dlg.m_ofn.lpstrFile = p;
+        dlg.m_ofn.lpstrFile = old;
+
         m_Page1.UpdateData(FALSE);
         CalcSize();
     }
 }
 
-void CMasteringFileDialog::OnTcnSelchangeTab(NMHDR* pNMHDR, LRESULT* pResult)
+void CMasteringFileDialog::OnTcnSelchangeTab(NMHDR* /*pNMHDR*/, LRESULT* pResult)
 {
     *pResult = 0;
     ChangeTab();
@@ -272,15 +280,15 @@ void CMasteringFileDialog::OnBnClickedWriting()
 
     CalcSize();
 
+    // Only warn if we actually know lead-out position
     if (m_LeadOutPos > 0 && m_ImageSize > (m_LeadOutPos - 150))
     {
         if (MessageBox(STR(5), CONF_MSG, MB_YESNO) == IDNO)
-        {
             return;
-        }
     }
 
     SetWindowPos(&wndNoTopMost, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
     Dlg.m_CD = m_CD;
     Dlg.m_CueSheetName = MSG(94);
     Dlg.m_DisableChangingFile = true;
@@ -300,33 +308,50 @@ void CMasteringFileDialog::OnBnClickedWriting()
 void CMasteringFileDialog::GetLeadOutPos(void)
 {
     BYTE Buffer[400];
-    memset(Buffer, 0, 400);
+    std::memset(Buffer, 0, sizeof(Buffer));
 
-    if (m_CD->ReadATIP(Buffer))
+    if (m_CD && m_CD->ReadATIP(Buffer))
     {
+        // ATIP lead-out is in MSF at [12..14]
         m_LeadOutPos = ((Buffer[12] * 60) + Buffer[13]) * 75 + Buffer[14];
     }
-
     else
     {
+        // Unknown (common on some media / drives)
         m_LeadOutPos = 0;
     }
+}
+
+static DWORD SafeGetFileSizeBytes(LPCTSTR path)
+{
+    HANDLE hFile = ::CreateFile(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return 0;
+
+    DWORD size = ::GetFileSize(hFile, nullptr);
+    ::CloseHandle(hFile);
+
+    if (size == INVALID_FILE_SIZE)
+        return 0;
+
+    return size;
 }
 
 void CMasteringFileDialog::CalcSize(void)
 {
     MSFAddress msf;
-    DWORD size;
-    int i;
-    UpdateData(TRUE);
-    size = 0;
+    DWORD size = 0;
 
-    for (i = 0; i < m_TrackList->GetItemCount(); i++)
+    UpdateData(TRUE);
+
+    const int count = m_TrackList->GetItemCount();
+    for (int i = 0; i < count; i++)
     {
         if (m_TrackList->GetItemData(i) == 0)
         {
-            CString tt;
-            tt = m_Page1.m_TrackList.GetItemText(0, 1);
+            // NOTE: Original code used (0,1) which is almost certainly a bug.
+            // Track type should come from row i.
+            CString tt = m_TrackList->GetItemText(i, 1);
 
             if (tt == "Mastering")
             {
@@ -335,55 +360,45 @@ void CMasteringFileDialog::CalcSize(void)
                 iso.CreateJolietHeader(&m_Dir);
                 size += iso.GetImageSize();
             }
-
             else
             {
-                DWORD FileSize;
-                HANDLE hFile;
-                CString cs;
-                cs = m_TrackList->GetItemText(i, 2);
-                hFile = CreateFile(cs, 0, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-                FileSize = GetFileSize(hFile, nullptr);
-                CloseHandle(hFile);
+                CString cs = m_TrackList->GetItemText(i, 2);
+                DWORD FileSize = SafeGetFileSizeBytes(cs);
 
                 if (tt == "MODE1/2048")
                 {
-                    size += FileSize / 2048;
+                    size += (FileSize / 2048);
                 }
-
                 else if (tt == "MODE1/2352" || tt == "MODE2/2352")
                 {
-                    size += FileSize / 2352;
+                    size += (FileSize / 2352);
                 }
             }
         }
-
         else
         {
-            HANDLE hFile;
-            CString cs;
-            cs = m_TrackList->GetItemText(i, 2);
-            hFile = CreateFile(cs, 0, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            size += (GetFileSize(hFile, nullptr) + 2352 - 45) / 2352;
-            CloseHandle(hFile);
+            CString cs = m_TrackList->GetItemText(i, 2);
+            DWORD FileSize = SafeGetFileSizeBytes(cs);
+            size += (FileSize + 2352 - 45) / 2352;
         }
     }
 
     msf = size;
     m_ImageSize = size;
+
     GetLeadOutPos();
 
     if (m_LeadOutPos == 0)
     {
-        m_Size.Format("%02d:%02d:%02d / **:**:**", msf.Minute, msf.Second, msf.Frame);
+        m_Size.Format(_T("%02d:%02d:%02d / **:**:**"), msf.Minute, msf.Second, msf.Frame);
     }
-
     else
     {
         MSFAddress lo;
         lo = m_LeadOutPos - 150;
-        m_Size.Format("%02d:%02d:%02d / %02d:%02d:%02d", msf.Minute, msf.Second, msf.Frame, lo.Minute, lo.Second,
-                      lo.Frame);
+        m_Size.Format(_T("%02d:%02d:%02d / %02d:%02d:%02d"),
+            msf.Minute, msf.Second, msf.Frame,
+            lo.Minute, lo.Second, lo.Frame);
     }
 
     UpdateData(FALSE);
@@ -392,6 +407,7 @@ void CMasteringFileDialog::CalcSize(void)
 void CMasteringFileDialog::SetLanguage(void)
 {
     int i;
+
     DWORD MenuString[][2] =
     {
         {IDCANCEL, 4},
@@ -408,6 +424,7 @@ void CMasteringFileDialog::SetLanguage(void)
         {ID_TRACK_ISO, 15},
         {IDC_EXPLORER, 16},
     };
+
     DWORD CtrlString[][2] =
     {
         {IDC_CREATE_ISO, 6},
@@ -425,21 +442,21 @@ void CMasteringFileDialog::SetLanguage(void)
     for (i = 0; i < 13; i++)
     {
         GetMenu()->ModifyMenu(MenuString[i][0], MF_BYCOMMAND | MF_STRING, MenuString[i][0],
-                              theSetting.m_Lang.m_Str[LP_MASTERINGMENU + MenuString[i][1]]);
+            theSetting.m_Lang.m_Str[LP_MASTERINGMENU + MenuString[i][1]]);
     }
 
     SetWindowText(STR(0));
 
     for (i = 0; i < 5; i++)
     {
-        this->SetDlgItemText(CtrlString[i][0], STR(CtrlString[i][1]));
+        SetDlgItemText(CtrlString[i][0], STR(CtrlString[i][1]));
     }
 
     GetMenu()->ModifyMenu(ID_CD_ERASE, MF_BYCOMMAND | MF_STRING, ID_CD_ERASE, theSetting.m_Lang.m_Str[LP_MAINMENU + 9]);
-    GetMenu()->ModifyMenu(ID_CD_ERASE_FAST, MF_BYCOMMAND | MF_STRING, ID_CD_ERASE_FAST,
-                          theSetting.m_Lang.m_Str[LP_MAINMENU + 10]);
-    this->SetDlgItemText(ID_CD_ERASE, theSetting.m_Lang.m_Str[LP_MAINMENU + 9]);
-    this->SetDlgItemText(ID_CD_ERASE_FAST, theSetting.m_Lang.m_Str[LP_MAINMENU + 10]);
+    GetMenu()->ModifyMenu(ID_CD_ERASE_FAST, MF_BYCOMMAND | MF_STRING, ID_CD_ERASE_FAST, theSetting.m_Lang.m_Str[LP_MAINMENU + 10]);
+
+    SetDlgItemText(ID_CD_ERASE, theSetting.m_Lang.m_Str[LP_MAINMENU + 9]);
+    SetDlgItemText(ID_CD_ERASE_FAST, theSetting.m_Lang.m_Str[LP_MAINMENU + 10]);
 }
 
 void CMasteringFileDialog::OnWindowClose()
@@ -452,32 +469,40 @@ void CMasteringFileDialog::OnEditInsertfolder()
     if (m_Page2.GetStyle() & 0x10000000)
     {
         UpdateDialog(TRUE);
+
         BROWSEINFO brinfo;
-        LPMALLOC p;
-        LPITEMIDLIST brid;
+        std::memset(&brinfo, 0, sizeof(brinfo));
+
+        LPMALLOC p = nullptr;
+        LPITEMIDLIST brid = nullptr;
+
         char PathList[MAX_PATH + 1];
         char PathName[MAX_PATH];
+
         PathList[0] = '\0';
         PathName[0] = '\0';
-        SHGetMalloc(&p);
-        brinfo.hwndOwner = m_hWnd;
-        brinfo.pidlRoot = nullptr;
-        brinfo.pszDisplayName = PathList;
-        brinfo.lpszTitle = STR(18);
-        brinfo.ulFlags = BIF_RETURNONLYFSDIRS;
-        brinfo.lpfn = nullptr;
-        brid = SHBrowseForFolder(&brinfo);
 
-        if (brid)
+        if (SUCCEEDED(SHGetMalloc(&p)))
         {
-            SHGetPathFromIDList(brid, PathName);
-            p->Free(brid);
-            m_Page2.AddFileRec(PathName);
-        }
+            brinfo.hwndOwner = m_hWnd;
+            brinfo.pidlRoot = nullptr;
+            brinfo.pszDisplayName = PathList;
+            brinfo.lpszTitle = STR(18);
+            brinfo.ulFlags = BIF_RETURNONLYFSDIRS;
+            brinfo.lpfn = nullptr;
 
-        else
-        {
-            return;
+            brid = SHBrowseForFolder(&brinfo);
+            if (brid)
+            {
+                SHGetPathFromIDList(brid, PathName);
+                p->Free(brid);
+                m_Page2.AddFileRec(PathName);
+            }
+            else
+            {
+                // cancelled
+                return;
+            }
         }
 
         UpdateDialog(FALSE);
@@ -491,20 +516,10 @@ void CMasteringFileDialog::ChangeTab(void)
     m_Page2.ShowWindow(SW_HIDE);
     m_Page3.ShowWindow(SW_HIDE);
 
-    if (m_Tab.GetCurSel() == 0)
-    {
-        m_Page1.ShowWindow(SW_SHOW);
-    }
-
-    else if (m_Tab.GetCurSel() == 1)
-    {
-        m_Page2.ShowWindow(SW_SHOW);
-    }
-
-    else if (m_Tab.GetCurSel() == 2)
-    {
-        m_Page3.ShowWindow(SW_SHOW);
-    }
+    const int sel = m_Tab.GetCurSel();
+    if (sel == 0) m_Page1.ShowWindow(SW_SHOW);
+    else if (sel == 1) m_Page2.ShowWindow(SW_SHOW);
+    else if (sel == 2) m_Page3.ShowWindow(SW_SHOW);
 }
 
 void CMasteringFileDialog::UpdateDialog(bool bSaveAndValidate)
@@ -519,36 +534,22 @@ void CMasteringFileDialog::OnSetFocus(CWnd* pOldWnd)
 {
     CDialog::OnSetFocus(pOldWnd);
 
-    if (m_Tab.GetCurSel() == 0)
-    {
-        m_Page1.SetFocus();
-    }
-
-    else if (m_Tab.GetCurSel() == 1)
-    {
-        m_Page2.SetFocus();
-    }
-
-    else if (m_Tab.GetCurSel() == 2)
-    {
-        m_Page3.SetFocus();
-    }
+    const int sel = m_Tab.GetCurSel();
+    if (sel == 0) m_Page1.SetFocus();
+    else if (sel == 1) m_Page2.SetFocus();
+    else if (sel == 2) m_Page3.SetFocus();
 }
 
 void CMasteringFileDialog::OnBnClickedExplorer()
 {
-    ShellExecute(m_hWnd, "explore", nullptr, nullptr, nullptr, SW_SHOWNORMAL);
+    ::ShellExecute(m_hWnd, "explore", nullptr, nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void CMasteringFileDialog::OnCbnSelchangeDrivelist()
 {
-    int Index;
-    Index = m_DriveList.GetCurSel();
-
+    const int Index = m_DriveList.GetCurSel();
     if (Index == CB_ERR)
-    {
         return;
-    }
 
     m_CD->GetAspiCtrl()->SetDevice(Index);
     GetLeadOutPos();
@@ -562,7 +563,7 @@ void CMasteringFileDialog::OnCancel()
 
 void CMasteringFileDialog::OnOK()
 {
-    //  CDialog::OnOK();
+    // intentionally no close in original
 }
 
 void CMasteringFileDialog::OnCdErase()
