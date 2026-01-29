@@ -20,7 +20,7 @@ protected:
     CString m_ImageDir;
     CString m_CueLine;
     int m_TrackCount;
-    CueSheet m_Cue[99];
+    CueSheet m_Cue[100];
     CString m_ImageFile;
     CString m_ErrorMessage;
     DWORD m_ImageSize;

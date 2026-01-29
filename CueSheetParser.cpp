@@ -26,7 +26,7 @@ bool CCueSheetParser::Parse(LPCSTR CueSheet, LPCSTR ImageDir, DWORD ImageSize)
         m_ImageDir += "\\";
     }
 
-    for (i = 0; i < 99; i++)
+    for (i = 0; i < 100; i++)
     {
         m_Cue[i].m_Frames = 0x0;
         m_Cue[i].m_PregapLBA = 0xffffffff;
@@ -56,6 +56,12 @@ bool CCueSheetParser::Parse(LPCSTR CueSheet, LPCSTR ImageDir, DWORD ImageSize)
                 TrackNo *= 10;
                 TrackNo += *p - '0';
                 p++;
+            }
+
+            if (TrackNo < 1 || TrackNo > 99)
+            {
+                m_ErrorMessage.Format(MSG(7), m_CueLine);
+                return false;
             }
 
             if (TrackNo != m_TrackCount + 1)
