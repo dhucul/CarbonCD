@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <memory>
 
 // Keep SS_ERR available
 #ifndef SS_ERR
@@ -54,6 +55,10 @@ public:
     virtual int   GetCurrentDevice();
 
 public:
+    void GetDiscInformation(CString& discInfo);
+
+    bool IsDriveReady();
+
     int debug = 0; // preserved
 
 private:

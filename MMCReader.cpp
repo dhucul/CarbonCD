@@ -2,7 +2,7 @@
 #include "MMCReader.h"
 
 #include <cstring>
-
+bool TryReadTOCWithFallback(CAspi* aspi, BYTE* buffer, DWORD bufLen);
 // ----------------------------------------------
 // Local helpers
 // ----------------------------------------------
@@ -42,55 +42,11 @@ void CMMCReader::Initialize(CAspi* Aspi)
 bool CMMCReader::ReadTOCFromSession(TableOfContents& Toc)
 {
     if (m_Aspi == nullptr) return false;
-
     std::memset(Toc.m_RawTOC, 0, sizeof(Toc.m_RawTOC));
 
-    auto exec_read_toc = [&](BYTE format) -> bool
-        {
-            SRB_ExecSCSICmd cmd;
-            std::memset(&cmd, 0, sizeof(cmd));
-            cmd.SRB_Flags = SRB_DIR_IN;
-            cmd.SRB_BufLen = sizeof(Toc.m_RawTOC);
-            cmd.SRB_BufPointer = static_cast<BYTE*>(Toc.m_RawTOC);
-            cmd.SRB_CDBLen = 10;
-
-            cmd.CDBByte[0] = 0x43;          // READ TOC/PMA/ATIP
-            cmd.CDBByte[1] = 0x02;          // MSF = 1 (your original behavior)
-            cmd.CDBByte[2] = format;        // 0x02 = Full TOC, 0x00 = Formatted TOC
-            cmd.CDBByte[6] = 0x00;          // Track/session number (0 for first / drive default)
-
-            cmd.CDBByte[7] = static_cast<BYTE>((sizeof(Toc.m_RawTOC) >> 8) & 0xFF);
-            cmd.CDBByte[8] = static_cast<BYTE>((sizeof(Toc.m_RawTOC)) & 0xFF);
-
-            m_Aspi->ExecuteCommand(cmd);
-            if (cmd.SRB_Status == SS_COMP) return true;
-
-            m_SRB_Status = cmd.SRB_Status;
-            // stash last sense decode for callers who look at it
-            m_SK = cmd.SenseArea[2] & 0x0F;
-            m_ASC = cmd.SenseArea[12];
-            m_ASCQ = cmd.SenseArea[13];
-
-            // If it's the classic "invalid field in CDB", caller may retry different format
-            return false;
-        };
-
-    // 1) Try Full TOC (format 0x02) first (matches your original parsing expectations)
-    if (!exec_read_toc(0x02))
-    {
-        // If drive rejects Full TOC with 05/24/00, retry with formatted TOC (0x00).
-        // NOTE: We don't have direct access to cmd.SenseArea here, but m_SK/m_ASC/m_ASCQ were set.
-        if (m_SK == 0x05 && m_ASC == 0x24 && m_ASCQ == 0x00)
-        {
-            std::memset(Toc.m_RawTOC, 0, sizeof(Toc.m_RawTOC));
-            if (!exec_read_toc(0x00))
-                return false;
-        }
-        else
-        {
-            return false;
-        }
-    }
+    // Use the fallback helper to read the TOC
+    if (!TryReadTOCWithFallback(m_Aspi, Toc.m_RawTOC, sizeof(Toc.m_RawTOC)))
+        return false;
 
     // ------------------------------------------------------------
     // Parse returned TOC.
@@ -793,7 +749,7 @@ bool CMMCReader::ReadATIP(BYTE* Buffer)
     cmd.SRB_Flags = SRB_DIR_IN;
 
     cmd.CDBByte[0] = 0x43;  // READ TOC/PMA/ATIP
-    cmd.CDBByte[1] = 0x02;  // MSF=1
+    cmd.CDBByte[1] = 0x00;  // MSF=0
     cmd.CDBByte[2] = 0x04;  // ATIP format
     cmd.CDBByte[7] = (BYTE)((BufferSize >> 8) & 0xFF);
     cmd.CDBByte[8] = (BYTE)(BufferSize & 0xFF);
@@ -824,6 +780,7 @@ int CMMCReader::ReadCDText(BYTE* Buffer)
     cmd.SRB_CDBLen = 10;
 
     cmd.CDBByte[0] = 0x43; // READ TOC/PMA/ATIP
+    cmd.CDBByte[1] = 0x00; // MSF=0
     cmd.CDBByte[2] = 0x05; // CD-TEXT
     cmd.CDBByte[7] = (BYTE)((sizeof(ReadBuffer) >> 8) & 0xFF);
     cmd.CDBByte[8] = (BYTE)(sizeof(ReadBuffer) & 0xFF);
@@ -844,4 +801,46 @@ int CMMCReader::ReadCDText(BYTE* Buffer)
 
     std::memcpy(Buffer, ReadBuffer + 4, len);
     return len;
+}
+
+bool TryReadTOCWithFallback(CAspi* aspi, BYTE* buffer, DWORD bufLen)
+{
+    struct TryFormat {
+        BYTE format;
+        BYTE msf;
+    } tryFormats[] = {
+        {0x02, 0x02}, // Full TOC, MSF=1
+        {0x02, 0x00}, // Full TOC, MSF=0
+        {0x00, 0x02}, // Formatted TOC, MSF=1
+        {0x00, 0x00}  // Formatted TOC, MSF=0
+    };
+
+    for (const auto& fmt : tryFormats)
+    {
+        SRB_ExecSCSICmd cmd = {};
+        cmd.SRB_Flags = SRB_DIR_IN;
+        cmd.SRB_BufLen = bufLen;
+        cmd.SRB_BufPointer = buffer;
+        cmd.SRB_CDBLen = 10;
+
+        cmd.CDBByte[0] = 0x43;      // READ TOC/PMA/ATIP
+        cmd.CDBByte[1] = fmt.msf;   // MSF bit
+        cmd.CDBByte[2] = fmt.format;// Format
+        cmd.CDBByte[6] = 0x00;      // Track/session number
+        cmd.CDBByte[7] = (BYTE)((bufLen >> 8) & 0xFF);
+        cmd.CDBByte[8] = (BYTE)(bufLen & 0xFF);
+
+        aspi->ExecuteCommand(cmd);
+
+        if (cmd.SRB_Status == SS_COMP)
+            return true;
+
+        // Check for "Illegal Request: Invalid field in CDB"
+        BYTE key = cmd.SenseArea[2] & 0x0F;
+        BYTE asc = cmd.SenseArea[12];
+        BYTE ascq = cmd.SenseArea[13];
+        if (!(key == 0x05 && asc == 0x24 && ascq == 0x00))
+            break; // Stop fallback if error is not "invalid field"
+    }
+    return false;
 }
