@@ -1,16 +1,20 @@
-﻿// mmcwriter_fixed.cpp
+﻿// MMCWriter.cpp  (complete replacement)
+// Fixes:
+//  1) SetCueSheet() no longer uses a fixed 2000-byte buffer -> prevents overflow/crash.
+//  2) SetCueSheet() validates EntryNumber/BufferLength and bounds checks.
+//  3) Keeps your original behavior for BCD patching + SEND CUE SHEET (0x5D).
+//  4) No functional changes elsewhere except extra safety guards.
+
 #include "StdAfx.h"
 #include "mmcwriter.h"
 #include "CDWriter.h"
 
-#include <cstdint>   // uintptr_t
-#include <cstring>   // memset, memcpy
+#include <cstdint>
+#include <cstring>
 
 // 16-byte align helper (safe on 32/64-bit)
 #define PGB(a) ((BYTE*)((((uintptr_t)(a)) + 0x0F) & ~(uintptr_t)0x0F))
 
-// This class allocates two ping-pong buffers sized for the largest frame mode (RAW+96)
-// and max frames (27). Keep this consistent with ctor allocation.
 static constexpr DWORD kMaxBufferedFramesHardLimit = 27;
 static constexpr DWORD kMaxFrameSizeBytes = (2352 + 96);
 static constexpr DWORD kBufferCapacityBytes = kMaxFrameSizeBytes * kMaxBufferedFramesHardLimit;
@@ -22,9 +26,10 @@ namespace
         BYTE sk{ 0 }, asc{ 0 }, ascq{ 0 };
     };
 
-    static inline SenseTriplet ExtractSense(const SRB_ExecSCSICmd& cmd)
+    static inline SenseTriplet ExtractSenseFixed(const SRB_ExecSCSICmd& cmd)
     {
         SenseTriplet s;
+        // Legacy code assumes fixed-format sense. (OK for your current stack.)
         s.sk = cmd.SenseArea[2] & 0x0f;
         s.asc = cmd.SenseArea[12];
         s.ascq = cmd.SenseArea[13];
@@ -37,7 +42,7 @@ namespace
         aspi->ExecuteCommand(cmd);
         if (cmd.SRB_Status != SS_COMP)
         {
-            outSense = ExtractSense(cmd);
+            outSense = ExtractSenseFixed(cmd);
             return false;
         }
         return true;
@@ -46,10 +51,10 @@ namespace
     static inline bool ScsiExecAsync(CAspi* aspi, SRB_ExecSCSICmd& cmd, SenseTriplet& outSense)
     {
         if (!aspi) return false;
-        aspi->ExecuteCommandAsync(cmd);
+        aspi->ExecuteCommandAsync(cmd); // Your SPTI driver now falls back to sync.
         if (cmd.SRB_Status != SS_COMP)
         {
-            outSense = ExtractSense(cmd);
+            outSense = ExtractSenseFixed(cmd);
             return false;
         }
         return true;
@@ -134,15 +139,13 @@ void CMMCWriter::Initialize(CAspi* aspi)
 bool CMMCWriter::CheckDisc(void)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     CPBBuffer PBuffer;
-    BYTE* Buffer;
-    SRB_ExecSCSICmd cmd;
+    BYTE* Buffer = PBuffer.CreateBuffer(256);
+    if (!Buffer) return false;
 
-    Buffer = PBuffer.CreateBuffer(256);
+    SRB_ExecSCSICmd cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.SRB_BufLen = 256;
     cmd.SRB_BufPointer = Buffer;
@@ -164,6 +167,7 @@ bool CMMCWriter::CheckDisc(void)
     m_LeadInLBA = 0;
     m_LeadInSize = 0;
 
+    // Your legacy rule: require blank disc (disc status == 0)
     if ((Buffer[2] & 0x03) != 0)
     {
         m_SK = 0;
@@ -190,15 +194,11 @@ DWORD CMMCWriter::GetLeadInSize(void)
 bool CMMCWriter::SetWriteParam(int WriteMode, bool BurnProof, bool TestMode, int BufferingFrames)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     const WriteModeSpec* spec = FindWriteSpec(WriteMode);
     if (!spec)
-    {
         return false;
-    }
 
     BYTE* Buffer;
     BYTE B[256 + 15];
@@ -210,21 +210,15 @@ bool CMMCWriter::SetWriteParam(int WriteMode, bool BurnProof, bool TestMode, int
 
     DataPoint = m_Aspi->ModeSense(Buffer, 256, 1, 5); // get default setting
     if (DataPoint == 0)
-    {
         return false;
-    }
 
     mp = Buffer + DataPoint;
     if ((mp[2] & 0x40) == 0)
-    {
         BurnProof = false;
-    }
 
     DataPoint = m_Aspi->ModeSense(Buffer, 256, 2, 5); // get default setting
     if (DataPoint == 0)
-    {
         return false;
-    }
 
     mp = Buffer + DataPoint;
     PageLen = mp[1] + 2;
@@ -243,11 +237,9 @@ bool CMMCWriter::SetWriteParam(int WriteMode, bool BurnProof, bool TestMode, int
     m_FrameSize = spec->frameSize;
 
     if (!m_Aspi->ModeSelect(Buffer, PageLen + DataPoint))
-    {
         return false;
-    }
 
-    // reset buffering state (must be done inside member function)
+    // Reset buffering state
     m_BufferingFrames = 0;
     m_BufferPoint = 0;
     m_BufferLBA = 0;
@@ -263,9 +255,7 @@ bool CMMCWriter::SetWriteParam(int WriteMode, bool BurnProof, bool TestMode, int
 void CMMCWriter::ResetParams(void)
 {
     if (m_Aspi == nullptr)
-    {
         return;
-    }
 
     BYTE* Buffer;
     BYTE B[256 + 15];
@@ -275,9 +265,7 @@ void CMMCWriter::ResetParams(void)
     Buffer = PGB(B);
     DataPoint = m_Aspi->ModeSense(Buffer, 256, 2, 5); // get default setting
     if (DataPoint == 0)
-    {
         return;
-    }
 
     PageLen = Buffer[DataPoint + 1] + 2;
     m_Aspi->ModeSelect(Buffer, PageLen + DataPoint);
@@ -286,14 +274,10 @@ void CMMCWriter::ResetParams(void)
 bool CMMCWriter::WriteBuffering(BYTE* Buffer, DWORD lba)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     if (m_MaxFrames == 0)
-    {
         return Write(Buffer, lba, 1);
-    }
 
     if (m_BufferingFrames == 0)
     {
@@ -301,10 +285,9 @@ bool CMMCWriter::WriteBuffering(BYTE* Buffer, DWORD lba)
         m_BufferLBA = lba;
     }
 
+    if (m_FrameSize == 0) return false;
     if (m_BufferPoint + m_FrameSize > kBufferCapacityBytes)
-    {
         return false;
-    }
 
     memcpy(m_Buffer + m_BufferPoint, Buffer, m_FrameSize);
     m_BufferingFrames++;
@@ -325,21 +308,15 @@ bool CMMCWriter::WriteBuffering(BYTE* Buffer, DWORD lba)
 bool CMMCWriter::WriteBufferingEx(BYTE* Buffer, DWORD lba, DWORD Size)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     if (m_FrameSize == 0 || (Size % m_FrameSize) != 0)
-    {
         return false;
-    }
 
     DWORD framesToAdd = Size / m_FrameSize;
 
     if (m_MaxFrames == 0)
-    {
         return Write(Buffer, lba, framesToAdd);
-    }
 
     if (m_BufferingFrames == 0)
     {
@@ -348,9 +325,7 @@ bool CMMCWriter::WriteBufferingEx(BYTE* Buffer, DWORD lba, DWORD Size)
     }
 
     if (m_BufferPoint + Size > kBufferCapacityBytes)
-    {
         return false;
-    }
 
     memcpy(m_Buffer + m_BufferPoint, Buffer, Size);
     m_BufferingFrames += framesToAdd;
@@ -371,14 +346,10 @@ bool CMMCWriter::WriteBufferingEx(BYTE* Buffer, DWORD lba, DWORD Size)
 bool CMMCWriter::Write(BYTE* Buffer, DWORD lba, DWORD WriteLen)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     if (WriteLen == 0)
-    {
         return true;
-    }
 
     const DWORD BufferLength = WriteLen * m_FrameSize;
 
@@ -416,9 +387,7 @@ bool CMMCWriter::Write(BYTE* Buffer, DWORD lba, DWORD WriteLen)
 int CMMCWriter::TestUnitReady(void)
 {
     if (m_Aspi == nullptr)
-    {
         return 1; // treat as error, NOT "ready"
-    }
 
     SRB_ExecSCSICmd cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -431,7 +400,7 @@ int CMMCWriter::TestUnitReady(void)
 
     if (cmd.SRB_Status != SS_COMP)
     {
-        SenseTriplet s = ExtractSense(cmd);
+        SenseTriplet s = ExtractSenseFixed(cmd);
         m_SK = s.sk; m_ASC = s.asc; m_ASCQ = s.ascq;
         return 1;
     }
@@ -445,16 +414,13 @@ int CMMCWriter::TestUnitReady(void)
 bool CMMCWriter::FlushBuffer(void)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     if (m_BufferingFrames != 0)
     {
         if (!Write(m_Buffer, m_BufferLBA, m_BufferingFrames))
-        {
             return false;
-        }
+
         m_BufferingFrames = 0;
         m_BufferPoint = 0;
     }
@@ -478,41 +444,61 @@ bool CMMCWriter::FlushBuffer(void)
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// FIXED: SetCueSheet() - safe allocation + validation + bounds checks
+// -----------------------------------------------------------------------------
 bool CMMCWriter::SetCueSheet(BYTE* Buffer, int EntryNumber)
 {
     if (m_Aspi == nullptr)
+        return false;
+
+    if (!Buffer || EntryNumber <= 0)
     {
+        m_SK = 0x05; m_ASC = 0x24; m_ASCQ = 0x00;
         return false;
     }
 
-    if (EntryNumber <= 0)
+    const DWORD BufferLength = static_cast<DWORD>(EntryNumber) * 8u;
+
+    // Sanity bounds: cue sheets are normally small; this prevents crazy/crash input.
+    if (BufferLength < 8u || BufferLength > 64u * 1024u)
     {
+        m_SK = 0x05; m_ASC = 0x24; m_ASCQ = 0x00;
         return false;
     }
-
-    const DWORD BufferLength = static_cast<DWORD>(EntryNumber) * 8;
 
     CPBBuffer PBuffer;
-    BYTE* CueBuffer = PBuffer.CreateBuffer(2000);
+    BYTE* CueBuffer = PBuffer.CreateBuffer(BufferLength + 16);
+    if (!CueBuffer)
+    {
+        m_SK = 0x04; m_ASC = 0x44; m_ASCQ = 0x00;
+        return false;
+    }
 
     // Patch -> modify cue-sheet
+    std::memcpy(CueBuffer, Buffer, BufferLength);
+
+    // Legacy: clear bytes 4..7 (only if present)
+    if (BufferLength >= 8)
+        std::memset(CueBuffer + 4, 0, 4);
+
+    for (int i = 1; i < EntryNumber; i++)
     {
-        memcpy(CueBuffer, Buffer, BufferLength);
-        memset(CueBuffer + 4, 0, 4);
+        BYTE* p = CueBuffer + (static_cast<DWORD>(i) * 8u);
 
-        for (int i = 1; i < EntryNumber; i++)
+        // defensive bounds check
+        if ((p + 8) > (CueBuffer + BufferLength))
         {
-            BYTE* p = CueBuffer + i * 8;
-
-            if (p[1] != 0xaa)
-            {
-                p[1] = bcd_to_bin(p[1]);
-            }
-
-            p[5] = bcd_to_bin(p[5]);
-            p[6] = bcd_to_bin(p[6]);
-            p[7] = bcd_to_bin(p[7]);
+            m_SK = 0x05; m_ASC = 0x24; m_ASCQ = 0x00;
+            return false;
         }
+
+        if (p[1] != 0xAA)
+            p[1] = bcd_to_bin(p[1]);
+
+        p[5] = bcd_to_bin(p[5]);
+        p[6] = bcd_to_bin(p[6]);
+        p[7] = bcd_to_bin(p[7]);
     }
 
     SRB_ExecSCSICmd cmd;
@@ -538,9 +524,7 @@ bool CMMCWriter::SetCueSheet(BYTE* Buffer, int EntryNumber)
 bool CMMCWriter::PerformPowerCalibration(void)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     SRB_ExecSCSICmd cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -562,9 +546,7 @@ bool CMMCWriter::PerformPowerCalibration(void)
 bool CMMCWriter::PreventMediaRemoval(bool BlockFlag)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     SRB_ExecSCSICmd cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -586,9 +568,7 @@ bool CMMCWriter::PreventMediaRemoval(bool BlockFlag)
 bool CMMCWriter::ReWind(void)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     SRB_ExecSCSICmd cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -609,9 +589,7 @@ bool CMMCWriter::ReWind(void)
 bool CMMCWriter::LoadTray(BYTE LoUnlo)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     SRB_ExecSCSICmd cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -633,9 +611,7 @@ bool CMMCWriter::LoadTray(BYTE LoUnlo)
 bool CMMCWriter::IsCDR(void)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     BYTE* Buffer;
     BYTE B[256 + 15];
@@ -645,9 +621,7 @@ bool CMMCWriter::IsCDR(void)
     Buffer = PGB(B);
     DataPoint = m_Aspi->ModeSense(Buffer, 256, 0, 0x2A); // get Drive feature
     if (DataPoint == 0)
-    {
         return false;
-    }
 
     mp = Buffer + DataPoint;
     return ((mp[3] & 0x03) != 0);
@@ -656,9 +630,7 @@ bool CMMCWriter::IsCDR(void)
 int CMMCWriter::GetBufferSize(void)
 {
     if (m_Aspi == nullptr)
-    {
         return 0;
-    }
 
     BYTE* Buffer;
     BYTE B[256 + 15];
@@ -668,9 +640,7 @@ int CMMCWriter::GetBufferSize(void)
     Buffer = PGB(B);
     DataPoint = m_Aspi->ModeSense(Buffer, 256, 0, 0x2A); // get Drive feature
     if (DataPoint == 0)
-    {
         return 0;
-    }
 
     mp = Buffer + DataPoint;
     return mp[12] * 0x100 + mp[13];
@@ -679,17 +649,13 @@ int CMMCWriter::GetBufferSize(void)
 bool CMMCWriter::SetWriteSpeed(BYTE Speed)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     SRB_ExecSCSICmd cmd;
     DWORD PSpeed = (Speed * 2352 * 75) / 1000;
 
     if (Speed == 0xff)
-    {
         PSpeed = 0xffff;
-    }
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.SRB_BufLen = 0;
@@ -717,9 +683,7 @@ bool CMMCWriter::SetWriteSpeed(BYTE Speed)
 bool CMMCWriter::EraseMedia(bool FastErase)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     SRB_ExecSCSICmd cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -748,13 +712,11 @@ void CMMCWriter::GetErrorParams(BYTE& SK, BYTE& ASC, BYTE& ASCQ)
 bool CMMCWriter::ReadTrackInfo(BYTE* Buffer)
 {
     if (m_Aspi == nullptr)
-    {
         return false;
-    }
 
     SRB_ExecSCSICmd cmd;
     CPBBuffer PBuffer;
-    PBuffer.CreateBuffer(36);
+    if (!PBuffer.CreateBuffer(36)) return false;
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.SRB_BufLen = 36;

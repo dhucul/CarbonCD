@@ -1,5 +1,10 @@
-#pragma once
+﻿#pragma once
+
 #include <atomic>
+#include <windows.h>
+#include <afxstr.h>
+#include <afxcmn.h>
+
 #include "logwindow.h"
 #include "cdwriter.h"
 #include "DirStructure.h"
@@ -14,33 +19,46 @@ public:
 
     CWriteThread(const CWriteThread&) = delete;
     CWriteThread& operator=(const CWriteThread&) = delete;
-    CLogWindow* m_LogWnd;
-    CCDController* m_CD;
-    CString m_CueFileName;
-    CWnd* m_ParentWnd;
-    CDirStructure* m_Dir;
-    CListCtrl* m_List;
-    CString m_VolumeLabel;
-    DWORD m_TotalFrames;
 
-protected:
-    HANDLE m_hThread = nullptr;
-    DWORD m_ThreadID = 0;
-    bool m_ModeMS = false;
+    // inputs (set by UI before StartThread)
+    CLogWindow* m_LogWnd = nullptr;
+    CCDController* m_CD = nullptr;
+    CString          m_CueFileName;
+
+    // ✅ UI thread handle only (worker thread posts to HWND)
+    HWND             m_hParentWnd = nullptr;
+
+    // mastering mode inputs
+    CDirStructure* m_Dir = nullptr;
+    CListCtrl* m_List = nullptr;
+    CString          m_VolumeLabel;
+    DWORD            m_TotalFrames = 0;
+
+    // state/results
+    std::atomic_bool m_StopFlag{ false };
+    bool             m_Success = false;
 
 public:
-    std::atomic_bool m_StopFlag{ false };
-    void StartThread(void);
-    void StopThread(void);
+    void  StartThread(void);
+    void  StopThread(void);
+
     DWORD ThreadFunction(void);
+
     DWORD WriteImage(void);
     DWORD WriteImageSubSS(void);
     DWORD WriteImageSubMS(void);
-    bool m_Success;
+
     DWORD Mastering(void);
-    bool CreateCueSheet(CString& CueSheet);
-    bool SkipAudioHeader(HANDLE hFile);
     DWORD MasteringSub(void);
-    int DetectCommand(void);
+
+    bool  CreateCueSheet(CString& CueSheet);
+    bool  SkipAudioHeader(HANDLE hFile);
+    int   DetectCommand(void);
+
     CSubcodeGeneratorMS m_SubMS;
+
+private:
+    HANDLE m_hThread = nullptr;
+    DWORD  m_ThreadID = 0;
+    bool   m_ModeMS = false;
 };

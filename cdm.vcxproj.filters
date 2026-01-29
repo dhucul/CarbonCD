@@ -389,6 +389,9 @@
     <ClInclude Include="WriteThread.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="WriteUiMessages.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="res\cdm.ico">

@@ -7,38 +7,9 @@
 #include "Setting.h"
 #define STR(i) (theSetting.m_Lang.m_Str[LP_WRITEP + i])
 
-#include <memory> // for std::unique_ptr
+#include <memory> // std::unique_ptr
 
-// Payloads from worker thread -> UI thread
-struct WriteUiUpdate
-{
-    bool hasMessage = false;
-    CString message;
-
-    bool hasPercent = false;
-    CString percent;
-
-    bool hasRawFlag = false;
-    CString rawFlag;
-
-    bool hasProgress = false;
-    int progress = 0; // 0..100
-
-    bool hasLog = false;
-    int logLevel = 0;
-    CString logText;
-
-    bool requestClose = false;
-    bool requestAutoSave = false;
-};
-
-// Payload for worker thread -> UI thread question (SendMessage)
-struct WriteUiQueryYesNo
-{
-    CString text;
-    CString caption;
-    UINT flags = MB_YESNO;
-};
+#include "WriteUiMessages.h" // ✅ shared structs + WM_APP ids
 
 IMPLEMENT_DYNAMIC(CWriteProgressDialog, CDialog)
 
@@ -53,8 +24,7 @@ CWriteProgressDialog::CWriteProgressDialog(CWnd* pParent /*=nullptr*/)
 
 CWriteProgressDialog::~CWriteProgressDialog()
 {
-    // Best-effort: ensure thread isn't left running if dialog is destroyed.
-    // (Assumes StopThread() is safe to call even if already stopped.)
+    // Best-effort shutdown
     m_Thread.StopThread();
 }
 
@@ -84,19 +54,17 @@ END_MESSAGE_MAP()
 
 void CWriteProgressDialog::OnBnClickedOk()
 {
-    // Intentionally disabled: progress dialog shouldn't close via OK.
-    // OnOK();
+    // progress dialog shouldn't close via OK
 }
 
 void CWriteProgressDialog::OnBnClickedCancel()
 {
-    // IMPORTANT: if LogWindow is a real UI window, this call is UI-thread safe here.
     if (m_Thread.m_LogWnd)
         m_Thread.m_LogWnd->AddMessage(LOG_WARNING, MSG(17));
 
-    m_Thread.m_StopFlag = true;
+    // atomic stop request
+    m_Thread.m_StopFlag.store(true, std::memory_order_release);
 
-    // Optional UX improvement: prevent repeated clicks
     if (::IsWindow(m_CancelButton.GetSafeHwnd()))
         m_CancelButton.EnableWindow(FALSE);
 }
@@ -111,9 +79,11 @@ BOOL CWriteProgressDialog::OnInitDialog()
 
     m_Progress.SetRange(0, 100);
 
-    // Ensure the thread has the dialog pointer before starting
-    m_Thread.m_ParentWnd = this;
+    // ✅ SAFETY: store HWND only (no CWnd* shared with worker thread)
+    m_Thread.m_hParentWnd = this->GetSafeHwnd();
 
+    // If your dialog is used by DoModal callers, they often set thread params before DoModal.
+    // Starting here is fine if that's your design.
     m_Thread.StartThread();
     return TRUE;
 }
@@ -123,11 +93,12 @@ void CWriteProgressDialog::WriteDisc(LPCSTR FileName, CCDController* CD, CLogWin
     m_Thread.m_LogWnd = Log;
     m_Thread.m_CD = CD;
     m_Thread.m_CueFileName = FileName;
-    m_Thread.m_ParentWnd = this;
+
+    // ✅ SAFETY
+    m_Thread.m_hParentWnd = this->GetSafeHwnd();
 
     DoModal();
 
-    // DoModal exits after OnCancel/EndDialog. Stop thread after modal returns.
     m_Thread.StopThread();
 }
 
@@ -140,10 +111,12 @@ void CWriteProgressDialog::Mastering(
 {
     m_Thread.m_LogWnd = Log;
     m_Thread.m_CD = CD;
-    m_Thread.m_ParentWnd = this;
     m_Thread.m_List = List;
     m_Thread.m_Dir = Dir;
     m_Thread.m_VolumeLabel = VolumeLabel;
+
+    // ✅ SAFETY
+    m_Thread.m_hParentWnd = this->GetSafeHwnd();
 
     DoModal();
 
@@ -165,7 +138,7 @@ void CWriteProgressDialog::OnWindowClose()
 {
     CMessageDialog dlg;
 
-    // Stop worker (if cancel was already requested, just stop)
+    // Stop worker before closing dialog
     m_Thread.StopThread();
 
     if (!m_Thread.m_Success)
@@ -191,7 +164,7 @@ void CWriteProgressDialog::OnWindowClose()
 
 void CWriteProgressDialog::OnUpdateDialog()
 {
-    // Legacy: you can keep this, but worker thread should no longer use it.
+    // Legacy: okay to keep
     UpdateData(FALSE);
 }
 
@@ -202,14 +175,14 @@ LRESULT CWriteProgressDialog::OnWriteUiUpdate(WPARAM, LPARAM lParam)
     if (!up)
         return 0;
 
-    if (up->hasMessage) m_Message = up->message;
-    if (up->hasPercent) m_Percent = up->percent;
-    if (up->hasRawFlag) m_RawFlag = up->rawFlag;
+    if (up->hasMessage)  m_Message = up->message;
+    if (up->hasPercent)  m_Percent = up->percent;
+    if (up->hasRawFlag)  m_RawFlag = up->rawFlag;
 
     if (up->hasProgress)
         m_Progress.SetPos(up->progress);
 
-    // LogWindow updates must run on UI thread if it's a window
+    // LogWindow updates must happen on UI thread
     if (up->hasLog && m_Thread.m_LogWnd)
         m_Thread.m_LogWnd->AddMessage(up->logLevel, up->logText);
 
@@ -234,7 +207,6 @@ LRESULT CWriteProgressDialog::OnWriteQueryYesNo(WPARAM, LPARAM lParam)
     return (LRESULT)::MessageBox(m_hWnd, q->text, q->caption, q->flags);
 }
 
-// Handle the window "X" close button
 void CWriteProgressDialog::OnClose()
 {
     OnWindowClose();
